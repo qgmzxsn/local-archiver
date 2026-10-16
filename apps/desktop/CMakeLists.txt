@@ -4,8 +4,13 @@ qt_standard_project_setup()
 add_library(archiver_desktop STATIC
   MainWindow.cpp
   MainWindow.hpp
+  password_book.cpp
+  password_book.hpp
 )
 target_link_libraries(archiver_desktop PUBLIC Qt6::Widgets Qt6::Concurrent archiver)
+if(WIN32)
+  target_link_libraries(archiver_desktop PUBLIC advapi32)
+endif()
 target_include_directories(archiver_desktop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 archiver_warnings(archiver_desktop)
 qt_add_executable(local-archiver main.cpp)

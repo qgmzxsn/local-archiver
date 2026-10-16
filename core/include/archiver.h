@@ -21,7 +21,7 @@ extern "C" {
 #  define ARCHIVER_API __attribute__((visibility("default")))
 #endif
 
-#define ARCHIVER_VERSION "0.2.0"
+#define ARCHIVER_VERSION "0.3.0"
 
 typedef enum ArchiverResult {
   ARCHIVER_OK = 0,
@@ -33,7 +33,10 @@ typedef enum ArchiverResult {
   ARCHIVER_ERR_PASSWORD = 6,
   ARCHIVER_ERR_PATH = 7,
   ARCHIVER_ERR_UNSUPPORTED = 8,
-  ARCHIVER_ERR_CANCELLED = 9
+  ARCHIVER_ERR_CANCELLED = 9,
+  ARCHIVER_ERR_MISSING_VOLUME = 10,
+  ARCHIVER_ERR_NEED_CHOICE = 11,
+  ARCHIVER_ERR_LIMIT = 12
 } ArchiverResult;
 
 typedef struct ArchiverArchive ArchiverArchive;
@@ -43,6 +46,10 @@ typedef struct ArchiverEntry {
   int is_directory;
   int is_symlink;
   uint64_t size;
+  /* Added after the original fields. packed_size is 0 when the handler
+     does not report one. modified_unix is seconds since 1970, or -1. */
+  uint64_t packed_size;
+  int64_t modified_unix;
 } ArchiverEntry;
 
 /* password is used only for this call. NULL means the user did not type one.
@@ -87,6 +94,39 @@ ARCHIVER_API const char *archiver_message(const ArchiverArchive *archive);
 ARCHIVER_API ArchiverResult archiver_check_entry_path(const char *path);
 ARCHIVER_API ArchiverResult archiver_check_symlink(const char *link_path,
                                                     const char *target);
+
+/* Try passwords[0..count) in order. Header check only: the first password
+   that opens the archive (and decrypts the first encrypted item, for formats
+   that do not fail at Open) is kept. *matched_index is that index, or -1
+   when no password was needed. On failure the result is the same as
+   archiver_open, including PASSWORD_REQUIRED when every password fails.
+   This function does not prompt and does not write the passwords anywhere. */
+ARCHIVER_API ArchiverResult archiver_open_with_passwords(const char *archive_path,
+                                                          const char *engine_path,
+                                                          const char *const *passwords,
+                                                          uint32_t password_count,
+                                                          int32_t *matched_index,
+                                                          ArchiverArchive **out);
+
+/* Check archive bytes without writing them. */
+ARCHIVER_API ArchiverResult archiver_test(ArchiverArchive *archive, const char *password);
+
+/* Store the named files into a new ZIP. Names inside the ZIP are the file
+   basenames. This does not create RAR. */
+ARCHIVER_API ArchiverResult archiver_create_zip(const char *zip_path,
+                                                 const char *const *files,
+                                                 uint32_t file_count);
+
+/* Extract archive layers until the payload is not an archive.
+   Stops on a bad password, a missing volume, more than one archive in a
+   layer when chosen_inner is NULL, or a depth / byte / file-count / ratio limit.
+   chosen_inner is the relative path of the archive to continue, or NULL.
+   message_buf receives a short detail and never a password. */
+ARCHIVER_API ArchiverResult archiver_extract_nested(
+    const char *archive_path, const char *engine_path, const char *dest_dir,
+    const char *const *passwords, uint32_t password_count, const char *chosen_inner,
+    ArchiverProgressCallback progress, void *progress_user, char *message_buf,
+    uint32_t message_cap);
 
 #ifdef __cplusplus
 }

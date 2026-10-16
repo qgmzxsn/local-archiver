@@ -3,12 +3,17 @@
 #include <QApplication>
 #include <QDir>
 #include <QIcon>
+#include <QStyleFactory>
 #include <QTimer>
 #include <QTranslator>
 #include "archiver.h"
 
 int main(int argc, char **argv) {
   QApplication app(argc, argv);
+  if (QStyle *vista = QStyleFactory::create(QStringLiteral("windowsvista")))
+    QApplication::setStyle(vista);
+  else if (QStyle *windows = QStyleFactory::create(QStringLiteral("Windows")))
+    QApplication::setStyle(windows);
   QApplication::setApplicationName(QStringLiteral("local-archiver"));
   QApplication::setApplicationVersion(QStringLiteral(ARCHIVER_VERSION));
   QApplication::setWindowIcon(QIcon(QStringLiteral(":/local-archiver.ico")));

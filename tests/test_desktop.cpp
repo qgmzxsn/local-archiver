@@ -49,7 +49,16 @@ class DesktopTests : public QObject {
     QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 1);
     QVERIFY(extract->isEnabled());
     const QString dest = temp.path() + QStringLiteral("/输出😀");
-    window.findChild<QLineEdit *>("destinationEdit")->setText(dest);
+    QTimer acceptExtract;
+    connect(&acceptExtract, &QTimer::timeout, [&] {
+      if (auto *edit = QApplication::activeModalWidget()
+                           ? QApplication::activeModalWidget()->findChild<QLineEdit *>("destinationEdit")
+                           : nullptr) {
+        edit->setText(dest);
+        if (auto *ok = edit->window()->findChild<QPushButton *>("extractOk")) ok->click();
+      }
+    });
+    acceptExtract.start(10);
     extract->click();
     QVERIFY(window.isBusy());
     QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
@@ -79,7 +88,14 @@ class DesktopTests : public QObject {
     QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
     QCOMPARE(prompts, 1);
     const QString dest = temp.path() + "/out";
-    window.findChild<QLineEdit *>("destinationEdit")->setText(dest);
+    QTimer acceptExtract;
+    connect(&acceptExtract, &QTimer::timeout, [&] {
+      if (auto *dialog = QApplication::activeModalWidget()) {
+        if (auto *edit = dialog->findChild<QLineEdit *>("destinationEdit")) edit->setText(dest);
+        if (auto *ok = dialog->findChild<QPushButton *>("extractOk")) ok->click();
+      }
+    });
+    acceptExtract.start(10);
     window.findChild<QPushButton *>("extractButton")->click();
     QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
     QCOMPARE(prompts, 1);
@@ -95,7 +111,15 @@ class DesktopTests : public QObject {
     MainWindow window;
     window.openPath(path);
     QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
-    window.findChild<QLineEdit *>("destinationEdit")->setText(temp.path() + "/out");
+    QTimer acceptExtract;
+    connect(&acceptExtract, &QTimer::timeout, [&] {
+      if (auto *dialog = QApplication::activeModalWidget()) {
+        if (auto *edit = dialog->findChild<QLineEdit *>("destinationEdit"))
+          edit->setText(temp.path() + "/out");
+        if (auto *ok = dialog->findChild<QPushButton *>("extractOk")) ok->click();
+      }
+    });
+    acceptExtract.start(10);
     window.findChild<QPushButton *>("extractButton")->click();
     window.findChild<QPushButton *>("cancelButton")->click();
     QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);

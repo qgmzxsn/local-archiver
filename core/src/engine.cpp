@@ -34,6 +34,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <algorithm>
@@ -48,6 +49,7 @@
 #  endif
 #  include <windows.h>
 #else
+#  include <dirent.h>
 #  include <dlfcn.h>
 #  include <fcntl.h>
 #  include <sys/stat.h>
@@ -103,7 +105,8 @@ std::string wide_to_utf8(const wchar_t *w, size_t n) {
   std::string out;
   for (size_t i = 0; i < n; ++i) {
     uint32_t cp = static_cast<uint32_t>(w[i]);
-    if (sizeof(wchar_t) == 2 && cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n) {
+    /* 7-Zip can hand back UTF-16 code units even when wchar_t is 32-bit. */
+    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n) {
       uint32_t low = static_cast<uint32_t>(w[i + 1]);
       if (low >= 0xDC00 && low <= 0xDFFF) {
         cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
@@ -135,7 +138,8 @@ std::wstring utf8_to_wide(const char *s) {
     } else {
       cp = *p++;
     }
-    if (sizeof(wchar_t) == 2 && cp > 0xFFFF) {
+    /* 7-Zip stores non-BMP characters as UTF-16 surrogates in wchar_t. */
+    if (cp > 0xFFFF) {
       cp -= 0x10000;
       out.push_back(static_cast<wchar_t>(0xD800 + (cp >> 10)));
       out.push_back(static_cast<wchar_t>(0xDC00 + (cp & 0x3FF)));
@@ -231,26 +235,47 @@ bool all_digits(const std::string &s) {
   return true;
 }
 
-bool is_split_name(const std::string &base) {
+/* .7z.001 / .zip.001 / bare .001, pkzip .zNN, rar .rNN and .partN.rar.
+   These open as archives. A plain file that only looks like a volume still
+   has to parse. */
+Kind split_kind(const std::string &base) {
+  size_t dot = base.rfind('.');
+  if (dot == std::string::npos || dot == 0) return Kind::Unsupported;
+  std::string ext = base.substr(dot + 1);
+  std::string stem = base.substr(0, dot);
+  if (ext.size() >= 2 && ext.size() <= 4 && all_digits(ext)) {
+    if (ends_with(stem, ".7z")) return Kind::SevenZ;
+    if (ends_with(stem, ".zip")) return Kind::Zip;
+    if (ends_with(stem, ".rar")) return Kind::Rar;
+    return Kind::SevenZ;
+  }
+  if (ext.size() == 3 && ext[0] == 'z' && ext[1] >= '0' && ext[1] <= '9' && ext[2] >= '0' &&
+      ext[2] <= '9') {
+    return Kind::Zip;
+  }
+  if (ext.size() == 3 && ext[0] == 'r' && ext[1] >= '0' && ext[1] <= '9' && ext[2] >= '0' &&
+      ext[2] <= '9') {
+    return Kind::Rar;
+  }
+  if (ends_with(base, ".rar")) {
+    size_t part = stem.rfind(".part");
+    if (part != std::string::npos && all_digits(stem.substr(part + 5))) return Kind::Rar;
+  }
+  return Kind::Unsupported;
+}
+
+bool numeric_volume_name(const std::string &path) {
+  std::string base = basename_lower(path);
   size_t dot = base.rfind('.');
   if (dot == std::string::npos) return false;
   std::string ext = base.substr(dot + 1);
-  if (ext.size() == 3 && all_digits(ext)) return true;
-  if (ext.size() == 3 && (ext[0] == 'z' || ext[0] == 'r') && ext[1] >= '0' && ext[1] <= '9' &&
-      ext[2] >= '0' && ext[2] <= '9') {
-    return true;
-  }
-  if (ends_with(base, ".rar")) {
-    std::string stem = base.substr(0, base.size() - 4);
-    size_t part = stem.rfind(".part");
-    if (part != std::string::npos && all_digits(stem.substr(part + 5))) return true;
-  }
-  return false;
+  return ext.size() >= 2 && ext.size() <= 4 && all_digits(ext);
 }
 
 Kind classify(const std::string &path) {
   std::string base = basename_lower(path);
-  if (is_split_name(base)) return Kind::Split;
+  Kind split = split_kind(base);
+  if (split != Kind::Unsupported) return split;
   if (ends_with(base, ".tar.gz") || ends_with(base, ".tgz")) return Kind::TarGz;
   if (ends_with(base, ".tar.bz2") || ends_with(base, ".tbz2") || ends_with(base, ".tbz"))
     return Kind::TarBz2;
@@ -306,19 +331,34 @@ struct ListedEntry {
   bool is_dir = false;
   bool is_symlink = false;
   uint64_t size = 0;
+  uint64_t packed_size = 0;
+  int64_t modified_unix = -1;
+};
+
+struct VolumeContext {
+  std::string directory;
+  std::string archive_name;
+  std::string missing;
+  std::string next_absent;
 };
 
 struct ArchiverArchive {
   EngineLib engine;
   CMyComPtr<IInStream> stream;
   CMyComPtr<IInArchive> archive;
+  CMyComPtr<IInArchive> owner_archive;
+  CMyComPtr<IInStream> owner_stream;
   std::vector<ListedEntry> entries;
   std::string message;
   std::string temp_dir;
+  std::string source_path;
+  VolumeContext volumes;
 
   ~ArchiverArchive() {
     archive.Release();
     stream.Release();
+    owner_archive.Release();
+    owner_stream.Release();
     engine.close();
     if (!temp_dir.empty()) {
       std::string inner = temp_dir + "/inner.bin";
@@ -527,11 +567,13 @@ Z7_COM7F_IMF(FileInStream::GetSize(UInt64 *size)) {
 }
 
 class OpenCallback Z7_final : public IArchiveOpenCallback,
+                              public IArchiveOpenVolumeCallback,
                               public ICryptoGetTextPassword,
                               public CMyUnknownImp {
-  Z7_IFACES_IMP_UNK_2(IArchiveOpenCallback, ICryptoGetTextPassword)
+  Z7_IFACES_IMP_UNK_3(IArchiveOpenCallback, IArchiveOpenVolumeCallback, ICryptoGetTextPassword)
  public:
   PasswordState *password = nullptr;
+  VolumeContext *volumes = nullptr;
 };
 
 Z7_COM7F_IMF(OpenCallback::SetTotal(const UInt64 * /*files*/, const UInt64 * /*bytes*/)) {
@@ -900,6 +942,119 @@ FileInStream *open_fd(const std::string &path, uint64_t slice_base = 0) {
   return stream;
 }
 
+std::string parent_dir_of(const std::string &path) {
+  size_t slash = path.find_last_of("/\\");
+  if (slash == std::string::npos) return std::string();
+  return path.substr(0, slash);
+}
+
+std::string base_name_of(const std::string &path) {
+  size_t slash = path.find_last_of("/\\");
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+std::string join_dir(const std::string &dir, const std::string &name) {
+  if (dir.empty()) return name;
+  if (dir.back() == '/' || dir.back() == '\\') return dir + name;
+#if defined(_WIN32)
+  return dir + "\\" + name;
+#else
+  return dir + "/" + name;
+#endif
+}
+
+bool regular_file_exists(const std::string &path) {
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path.c_str());
+  DWORD attr = ::GetFileAttributesW(wide.c_str());
+  return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+  struct stat st;
+  return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+bool next_volume_name(const std::string &name, std::string &out) {
+  std::string lower = name;
+  for (char &c : lower) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  size_t digit_end = name.size();
+  if (ends_with(lower, ".rar")) {
+    if (name.size() < 4) return false;
+    digit_end = name.size() - 4;
+  }
+  size_t i = digit_end;
+  while (i > 0 && name[i - 1] >= '0' && name[i - 1] <= '9') --i;
+  if (i == digit_end) return false;
+  std::string digits = name.substr(i, digit_end - i);
+  int carry = 1;
+  for (size_t k = digits.size(); k > 0; --k) {
+    int d = (digits[k - 1] - '0') + carry;
+    carry = d / 10;
+    digits[k - 1] = static_cast<char>('0' + (d % 10));
+  }
+  if (carry) digits.insert(digits.begin(), '1');
+  out = name.substr(0, i) + digits + name.substr(digit_end);
+  return out != name;
+}
+
+bool later_volume_exists(const std::string &dir, const std::string &missing_name) {
+  std::string cur = missing_name;
+  for (int step = 0; step < 8; ++step) {
+    std::string next;
+    if (!next_volume_name(cur, next)) return false;
+    if (regular_file_exists(join_dir(dir, next))) return true;
+    cur = next;
+  }
+  return false;
+}
+
+bool safe_volume_leaf(const wchar_t *name, std::string &utf8) {
+  if (!name || !name[0]) return false;
+  size_t n = 0;
+  while (name[n]) ++n;
+  utf8 = wide_to_utf8(name, n);
+  if (utf8.empty() || utf8 == "." || utf8 == "..") return false;
+  if (utf8.find('/') != std::string::npos || utf8.find('\\') != std::string::npos) return false;
+  if (utf8.find(':') != std::string::npos) return false;
+  if (utf8.find("..") != std::string::npos) return false;
+  return true;
+}
+
+Z7_COM7F_IMF(OpenCallback::GetProperty(PROPID propID, PROPVARIANT *value)) {
+  if (!value) return E_INVALIDARG;
+  memset(value, 0, sizeof(*value));
+  if (propID == kpidName && volumes && !volumes->archive_name.empty()) {
+    std::wstring wide = utf8_to_wide(volumes->archive_name.c_str());
+    value->vt = VT_BSTR;
+    value->bstrVal = alloc_wide(wide.c_str(), wide.size());
+    return value->bstrVal ? S_OK : E_OUTOFMEMORY;
+  }
+  return S_OK;
+}
+
+Z7_COM7F_IMF(OpenCallback::GetStream(const wchar_t *name, IInStream **inStream)) {
+  if (!inStream) return E_INVALIDARG;
+  *inStream = nullptr;
+  if (!volumes) return S_FALSE;
+  std::string leaf;
+  if (!safe_volume_leaf(name, leaf)) return S_FALSE;
+  std::string full = join_dir(volumes->directory, leaf);
+  FileInStream *raw = open_fd(full);
+  if (!raw) {
+    if (later_volume_exists(volumes->directory, leaf)) {
+      volumes->missing = leaf;
+      return E_FAIL;
+    }
+    if (volumes->next_absent.empty()) volumes->next_absent = leaf;
+    return S_FALSE;
+  }
+  CMyComPtr<IInStream> held(raw);
+  *inStream = held.Detach();
+  return S_OK;
+}
+
 bool read_at(const std::string &path, uint64_t offset, unsigned char *buf, size_t size, size_t *got) {
   *got = 0;
   if (size == 0) return true;
@@ -1037,10 +1192,60 @@ bool make_temp_dir(std::string &out) {
 #endif
 }
 
+std::string archive_error_text(IInArchive *archive) {
+  if (!archive) return std::string();
+  PROPVARIANT prop;
+  memset(&prop, 0, sizeof(prop));
+  if (archive->GetArchiveProperty(kpidError, &prop) != S_OK) {
+    prop_clear(&prop);
+    return std::string();
+  }
+  std::string out;
+  if (prop.vt == VT_BSTR) {
+    bool nul = false;
+    bstr_utf8(prop.bstrVal, out, nul);
+  }
+  prop_clear(&prop);
+  const char *prefix = "Missing volume : ";
+  size_t n = strlen(prefix);
+  if (out.compare(0, n, prefix) == 0) return out.substr(n);
+  return std::string();
+}
+
+void fill_volume_context(VolumeContext &ctx, const std::string &path) {
+  ctx.directory = parent_dir_of(path);
+  ctx.archive_name = base_name_of(path);
+  ctx.missing.clear();
+  ctx.next_absent.clear();
+}
+
+ArchiverResult finish_open_result(HRESULT hr, const PasswordState &password, VolumeContext *volumes,
+                                  IInArchive *opened, std::string &message) {
+  if (volumes && !volumes->missing.empty()) {
+    message = "missing volume: " + volumes->missing;
+    return ARCHIVER_ERR_MISSING_VOLUME;
+  }
+  ArchiverResult result = from_open_hr(hr, password);
+  if (result != ARCHIVER_OK) {
+    if (message.empty()) {
+      if (result == ARCHIVER_ERR_PASSWORD_REQUIRED) message = "password required";
+      else if (result == ARCHIVER_ERR_PASSWORD) message = "password rejected";
+      else message = "not a supported archive";
+    }
+    return result;
+  }
+  std::string missing = archive_error_text(opened);
+  if (!missing.empty()) {
+    message = "missing volume: " + missing;
+    return ARCHIVER_ERR_MISSING_VOLUME;
+  }
+  return ARCHIVER_OK;
+}
+
 ArchiverResult open_with(EngineLib &lib, const GUID &clsid, const std::string &path,
                          PasswordState &password, CMyComPtr<IInArchive> &archive,
                          CMyComPtr<IInStream> &stream, std::string &message,
-                         uint64_t slice_base = 0) {
+                         uint64_t slice_base = 0, VolumeContext *volumes = nullptr) {
   FileInStream *raw = open_fd(path, slice_base);
   if (!raw) {
     message = "could not open archive file";
@@ -1057,21 +1262,46 @@ ArchiverResult open_with(EngineLib &lib, const GUID &clsid, const std::string &p
   in_archive.Attach(static_cast<IInArchive *>(obj));
   OpenCallback *callback = new OpenCallback();
   callback->password = &password;
+  callback->volumes = volumes;
   CMyComPtr<IArchiveOpenCallback> held(callback);
   UInt64 max_check = 0;
   hr = in_archive->Open(in, &max_check, held);
-  ArchiverResult result = from_open_hr(hr, password);
+  ArchiverResult result = finish_open_result(hr, password, volumes, in_archive, message);
   if (result != ARCHIVER_OK) {
     in_archive->Close();
-    if (message.empty()) {
-      if (result == ARCHIVER_ERR_PASSWORD_REQUIRED) message = "password required";
-      else if (result == ARCHIVER_ERR_PASSWORD) message = "password rejected";
-      else message = "not a supported archive";
-    }
     return result;
   }
   archive = in_archive;
   stream = in;
+  return ARCHIVER_OK;
+}
+
+ArchiverResult open_on_stream(EngineLib &lib, const GUID &clsid, IInStream *in, PasswordState &password,
+                              CMyComPtr<IInArchive> &archive, std::string &message) {
+  if (!in) return ARCHIVER_ERR_FORMAT;
+  void *obj = nullptr;
+  HRESULT hr = lib.CreateObject(&clsid, &IID_IInArchive, &obj);
+  if (hr != S_OK || !obj) {
+    message = "7-Zip did not create an archive handler";
+    return ARCHIVER_ERR_ENGINE;
+  }
+  CMyComPtr<IInArchive> in_archive;
+  in_archive.Attach(static_cast<IInArchive *>(obj));
+  OpenCallback *callback = new OpenCallback();
+  callback->password = &password;
+  CMyComPtr<IArchiveOpenCallback> held(callback);
+  if (in->Seek(0, 0, nullptr) != S_OK) {
+    message = "not a supported archive";
+    return ARCHIVER_ERR_FORMAT;
+  }
+  UInt64 max_check = 0;
+  hr = in_archive->Open(in, &max_check, held);
+  ArchiverResult result = finish_open_result(hr, password, nullptr, in_archive, message);
+  if (result != ARCHIVER_OK) {
+    in_archive->Close();
+    return result;
+  }
+  archive = in_archive;
   return ARCHIVER_OK;
 }
 
@@ -1126,6 +1356,19 @@ ArchiverResult read_entries(IInArchive *archive, std::vector<ListedEntry> &entri
     uint64_t size = 0;
     if (archive->GetProperty(i, kpidSize, &prop) == S_OK) size = prop_u64(prop);
     prop_clear(&prop);
+    memset(&prop, 0, sizeof(prop));
+    uint64_t packed = 0;
+    if (archive->GetProperty(i, kpidPackSize, &prop) == S_OK) packed = prop_u64(prop);
+    prop_clear(&prop);
+    memset(&prop, 0, sizeof(prop));
+    int64_t modified = -1;
+    if (archive->GetProperty(i, kpidMTime, &prop) == S_OK && prop.vt == VT_FILETIME) {
+      uint64_t ticks = (static_cast<uint64_t>(prop.filetime.dwHighDateTime) << 32) |
+                       prop.filetime.dwLowDateTime;
+      const uint64_t epoch = 116444736000000000ull;
+      if (ticks >= epoch) modified = static_cast<int64_t>((ticks - epoch) / 10000000ull);
+    }
+    prop_clear(&prop);
     if (size > kWriteCap || declared > kWriteCap - size) {
       message = "archive declares more data than this build will write";
       return ARCHIVER_ERR_UNSUPPORTED;
@@ -1140,6 +1383,8 @@ ArchiverResult read_entries(IInArchive *archive, std::vector<ListedEntry> &entri
     entry.is_dir = is_dir;
     entry.is_symlink = !link.empty() || (posix & 0170000u) == 0120000u;
     entry.size = size;
+    entry.packed_size = packed;
+    entry.modified_unix = modified;
     entries.push_back(entry);
   }
   return ARCHIVER_OK;
@@ -1308,15 +1553,18 @@ PasswordState password_from(const char *password) {
 }
 
 ArchiverResult open_kind(ArchiverArchive *archive, Kind kind, const std::string &path,
-                         PasswordState &password) {
+                         PasswordState &password, VolumeContext *volumes = nullptr) {
   GUID clsid;
   if (!handler_for(archive->engine, kind, path, clsid, archive->message)) {
     return archive->message.find("could not open") != std::string::npos ? ARCHIVER_ERR_IO
                                                                          : ARCHIVER_ERR_ENGINE;
   }
   return open_with(archive->engine, clsid, path, password, archive->archive, archive->stream,
-                   archive->message);
+                   archive->message, 0, volumes);
 }
+
+ArchiverResult open_numeric_volume(ArchiverArchive *archive, Kind kind, const std::string &path,
+                                   PasswordState &password);
 
 static const char *kEmptyMessage = "";
 
@@ -1332,6 +1580,9 @@ const char *archiver_result_string(ArchiverResult result) {
     case ARCHIVER_ERR_PATH: return "path";
     case ARCHIVER_ERR_UNSUPPORTED: return "unsupported";
     case ARCHIVER_ERR_CANCELLED: return "cancelled";
+    case ARCHIVER_ERR_MISSING_VOLUME: return "missing-volume";
+    case ARCHIVER_ERR_NEED_CHOICE: return "need-choice";
+    case ARCHIVER_ERR_LIMIT: return "limit";
   }
   return "error";
 }
@@ -1397,6 +1648,119 @@ bool guid_for_kind(EngineLib &lib, Kind kind, const std::string &path, uint64_t 
     return false;
   }
   return true;
+}
+
+Kind kind_from_signature(const unsigned char *sig, size_t n) {
+  if (n >= 4 && is_zip_local(sig)) return Kind::Zip;
+  if (n >= 6 && is_7z_sig(sig)) return Kind::SevenZ;
+  if (n >= 7 && is_rar_sig(sig)) return Kind::Rar;
+  return Kind::Unsupported;
+}
+
+ArchiverResult open_numeric_volume(ArchiverArchive *archive, Kind kind, const std::string &path,
+                                   PasswordState &password) {
+  GUID split_id;
+  if (!find_handler(archive->engine, "Split", split_id)) {
+    archive->message = "7-Zip library has no split handler";
+    return ARCHIVER_ERR_ENGINE;
+  }
+  fill_volume_context(archive->volumes, path);
+  CMyComPtr<IInArchive> split;
+  CMyComPtr<IInStream> split_stream;
+  ArchiverResult opened = open_with(archive->engine, split_id, path, password, split, split_stream,
+                                     archive->message, 0, &archive->volumes);
+  if (opened != ARCHIVER_OK) {
+    if (opened == ARCHIVER_ERR_MISSING_VOLUME || opened == ARCHIVER_ERR_PASSWORD ||
+        opened == ARCHIVER_ERR_PASSWORD_REQUIRED) {
+      return opened;
+    }
+    archive->message.clear();
+    return open_kind(archive, kind, path, password, &archive->volumes);
+  }
+
+  IInArchiveGetStream *raw_getter = nullptr;
+  if (split->QueryInterface(IID_IInArchiveGetStream, reinterpret_cast<void **>(&raw_getter)) != S_OK ||
+      !raw_getter) {
+    archive->message = "not a supported archive";
+    split->Close();
+    return ARCHIVER_ERR_FORMAT;
+  }
+  CMyComPtr<IInArchiveGetStream> getter;
+  getter.Attach(raw_getter);
+  CMyComPtr<ISequentialInStream> seq;
+  if (getter->GetStream(0, &seq) != S_OK || !seq) {
+    archive->message = "not a supported archive";
+    split->Close();
+    return ARCHIVER_ERR_FORMAT;
+  }
+  IInStream *raw_sub = nullptr;
+  if (seq->QueryInterface(IID_IInStream, reinterpret_cast<void **>(&raw_sub)) != S_OK || !raw_sub) {
+    archive->message = "not a supported archive";
+    split->Close();
+    return ARCHIVER_ERR_FORMAT;
+  }
+  CMyComPtr<IInStream> sub;
+  sub.Attach(raw_sub);
+  unsigned char sig[8];
+  memset(sig, 0, sizeof(sig));
+  size_t got = 0;
+  if (sub->Seek(0, 0, nullptr) != S_OK) {
+    archive->message = "not a supported archive";
+    split->Close();
+    return ARCHIVER_ERR_FORMAT;
+  }
+  UInt32 read = 0;
+  if (sub->Read(sig, sizeof(sig), &read) != S_OK) {
+    archive->message = "not a supported archive";
+    split->Close();
+    return ARCHIVER_ERR_FORMAT;
+  }
+  got = read;
+  Kind inner = kind_from_signature(sig, got);
+  std::string base = basename_lower(path);
+  if (base.find(".7z.") != std::string::npos && inner != Kind::SevenZ) {
+    archive->message = "not a 7z volume";
+    split->Close();
+    return ARCHIVER_ERR_FORMAT;
+  }
+  if (base.find(".zip.") != std::string::npos && inner != Kind::Zip) {
+    archive->message = "not a zip volume";
+    split->Close();
+    return ARCHIVER_ERR_FORMAT;
+  }
+  if (inner == Kind::Unsupported) inner = kind;
+  GUID inner_id;
+  std::string saved_absent = archive->volumes.next_absent;
+  bool have_handler = false;
+  if (inner == Kind::Rar) {
+    bool rar5 = got >= 8 && is_rar_sig(sig) && sig[6] == 1;
+    have_handler = find_handler(archive->engine, rar5 ? "Rar5" : "Rar", inner_id);
+    if (!have_handler) archive->message = "7-Zip library has no RAR handler";
+  } else {
+    have_handler = guid_for_kind(archive->engine, inner, path, 0, inner_id, archive->message);
+  }
+  if (!have_handler) {
+    split->Close();
+    return ARCHIVER_ERR_ENGINE;
+  }
+  CMyComPtr<IInArchive> inner_archive;
+  ArchiverResult inner_open =
+      open_on_stream(archive->engine, inner_id, sub, password, inner_archive, archive->message);
+  if (inner_open != ARCHIVER_OK) {
+    split->Close();
+    if (!saved_absent.empty() && inner_open != ARCHIVER_ERR_PASSWORD &&
+        inner_open != ARCHIVER_ERR_PASSWORD_REQUIRED) {
+      archive->message = "missing volume: " + saved_absent;
+      return ARCHIVER_ERR_MISSING_VOLUME;
+    }
+    return inner_open;
+  }
+  archive->owner_archive = split;
+  archive->owner_stream = split_stream;
+  archive->archive = inner_archive;
+  archive->stream = sub;
+  archive->message.clear();
+  return ARCHIVER_OK;
 }
 
 void close_open_archive(ArchiverArchive *archive) {
@@ -1556,7 +1920,6 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
   if (!archive_path || !archive_path[0]) return ARCHIVER_ERR_ARGUMENT;
 
   Kind kind = classify(archive_path);
-  if (kind == Kind::Split) return ARCHIVER_ERR_UNSUPPORTED;
   bool disguise = false;
   if (kind == Kind::Unsupported) {
     if (!is_disguise_carrier(archive_path)) return ARCHIVER_ERR_UNSUPPORTED;
@@ -1564,6 +1927,8 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
   }
 
   std::unique_ptr<ArchiverArchive> archive(new ArchiverArchive());
+  archive->source_path = archive_path;
+  fill_volume_context(archive->volumes, archive_path);
   PasswordState pw = password_from(password);
   if (!load_engine(archive->engine, engine_path, archive->message)) {
     *out = archive.release();
@@ -1607,8 +1972,10 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
         }
       }
     }
+  } else if (numeric_volume_name(archive_path)) {
+    result = open_numeric_volume(archive.get(), kind, archive_path, pw);
   } else {
-    result = open_kind(archive.get(), kind, archive_path, pw);
+    result = open_kind(archive.get(), kind, archive_path, pw, &archive->volumes);
   }
 
   if (result == ARCHIVER_OK && archive->entries.empty()) {
@@ -1639,6 +2006,8 @@ ArchiverResult archiver_entry_at(const ArchiverArchive *archive, uint32_t index,
   out->is_directory = entry.is_dir ? 1 : 0;
   out->is_symlink = entry.is_symlink ? 1 : 0;
   out->size = entry.size;
+  out->packed_size = entry.packed_size;
+  out->modified_unix = entry.modified_unix;
   return ARCHIVER_OK;
 }
 
@@ -1689,6 +2058,548 @@ ArchiverResult archiver_extract_with_progress(
   UInt32 all = static_cast<UInt32>(-1);
   HRESULT hr = archive->archive->Extract(nullptr, all, 0, held);
   return from_extract(hr, ctx, pw, encrypted);
+}
+
+class ProbeCallback Z7_final : public IArchiveExtractCallback,
+                               public ICryptoGetTextPassword,
+                               public CMyUnknownImp {
+  Z7_IFACES_IMP_UNK_2(IArchiveExtractCallback, ICryptoGetTextPassword)
+  Z7_IFACE_COM7_IMP(IProgress)
+ public:
+  PasswordState *password = nullptr;
+  bool wrong = false;
+  bool data_error = false;
+  bool failed = false;
+};
+
+Z7_COM7F_IMF(ProbeCallback::SetTotal(UInt64 /*total*/)) { return S_OK; }
+Z7_COM7F_IMF(ProbeCallback::SetCompleted(const UInt64 * /*completeValue*/)) { return S_OK; }
+Z7_COM7F_IMF(ProbeCallback::PrepareOperation(Int32 /*askExtractMode*/)) { return S_OK; }
+Z7_COM7F_IMF(ProbeCallback::SetOperationResult(Int32 opRes)) {
+  if (opRes == NArchive::NExtract::NOperationResult::kWrongPassword) wrong = true;
+  else if (opRes == NArchive::NExtract::NOperationResult::kDataError ||
+           opRes == NArchive::NExtract::NOperationResult::kCRCError) {
+    data_error = true;
+  } else if (opRes != NArchive::NExtract::NOperationResult::kOK &&
+             opRes != NArchive::NExtract::NOperationResult::kUnavailable) {
+    failed = true;
+  }
+  if (wrong || data_error || failed) return E_ABORT;
+  return S_OK;
+}
+Z7_COM7F_IMF(ProbeCallback::CryptoGetTextPassword(BSTR *passwordOut)) {
+  if (!passwordOut) return E_ABORT;
+  *passwordOut = nullptr;
+  if (!password) return E_ABORT;
+  password->asked = true;
+  if (!password->provided) return E_ABORT;
+  *passwordOut = alloc_wide(password->text.c_str(), password->text.size());
+  return *passwordOut ? S_OK : E_OUTOFMEMORY;
+}
+Z7_COM7F_IMF(ProbeCallback::GetStream(UInt32 /*index*/, ISequentialOutStream **outStream,
+                                      Int32 /*askExtractMode*/)) {
+  if (outStream) *outStream = nullptr;
+  return S_OK;
+}
+
+ArchiverResult probe_encrypted(IInArchive *archive, PasswordState &password, std::string &message) {
+  if (!archive_has_encrypted_item(archive)) return ARCHIVER_OK;
+  UInt32 count = 0;
+  if (archive->GetNumberOfItems(&count) != S_OK) {
+    message = "could not list archive";
+    return ARCHIVER_ERR_FORMAT;
+  }
+  UInt32 index = 0;
+  bool found = false;
+  for (UInt32 i = 0; i < count; ++i) {
+    PROPVARIANT prop;
+    memset(&prop, 0, sizeof(prop));
+    bool encrypted = false;
+    bool is_dir = false;
+    if (archive->GetProperty(i, kpidEncrypted, &prop) == S_OK) encrypted = prop_bool(prop);
+    prop_clear(&prop);
+    memset(&prop, 0, sizeof(prop));
+    if (archive->GetProperty(i, kpidIsDir, &prop) == S_OK) is_dir = prop_bool(prop);
+    prop_clear(&prop);
+    if (encrypted && !is_dir) {
+      index = i;
+      found = true;
+      break;
+    }
+  }
+  if (!found) return ARCHIVER_OK;
+  ProbeCallback *callback = new ProbeCallback();
+  callback->password = &password;
+  CMyComPtr<IArchiveExtractCallback> held(callback);
+  HRESULT hr = archive->Extract(&index, 1, 1, held);
+  if (callback->wrong || callback->data_error ||
+      (callback->failed && password.asked && password.provided)) {
+    message = password.provided ? "password rejected" : "password required";
+    return password.provided ? ARCHIVER_ERR_PASSWORD : ARCHIVER_ERR_PASSWORD_REQUIRED;
+  }
+  if (password.asked && !password.provided) {
+    message = "password required";
+    return ARCHIVER_ERR_PASSWORD_REQUIRED;
+  }
+  if (hr != S_OK && hr != E_ABORT) {
+    message = "not a supported archive";
+    return ARCHIVER_ERR_FORMAT;
+  }
+  if (callback->failed) {
+    message = "not a supported archive";
+    return ARCHIVER_ERR_FORMAT;
+  }
+  return ARCHIVER_OK;
+}
+
+void copy_message(char *buffer, uint32_t cap, const std::string &text) {
+  if (!buffer || cap == 0) return;
+  size_t n = text.size();
+  if (n >= cap) n = cap - 1;
+  if (n) memcpy(buffer, text.data(), n);
+  buffer[n] = 0;
+}
+
+ArchiverResult archiver_open_with_passwords(const char *archive_path, const char *engine_path,
+                                            const char *const *passwords, uint32_t password_count,
+                                            int32_t *matched_index, ArchiverArchive **out) {
+  if (matched_index) *matched_index = -1;
+  if (!out) return ARCHIVER_ERR_ARGUMENT;
+  *out = nullptr;
+  ArchiverArchive *opened = nullptr;
+  ArchiverResult result = archiver_open(archive_path, engine_path, nullptr, &opened);
+  if (result == ARCHIVER_OK && opened && opened->archive &&
+      !archive_has_encrypted_item(opened->archive)) {
+    *out = opened;
+    return ARCHIVER_OK;
+  }
+  if (result != ARCHIVER_OK && result != ARCHIVER_ERR_PASSWORD &&
+      result != ARCHIVER_ERR_PASSWORD_REQUIRED) {
+    *out = opened;
+    return result;
+  }
+  archiver_close(opened);
+  opened = nullptr;
+  if (!passwords || password_count == 0) {
+    result = archiver_open(archive_path, engine_path, nullptr, out);
+    if (result == ARCHIVER_OK && *out && (*out)->archive &&
+        archive_has_encrypted_item((*out)->archive)) {
+      (*out)->message = "password required";
+      return ARCHIVER_ERR_PASSWORD_REQUIRED;
+    }
+    return result;
+  }
+  for (uint32_t i = 0; i < password_count; ++i) {
+    if (!passwords[i]) continue;
+    result = archiver_open(archive_path, engine_path, passwords[i], &opened);
+    if (result == ARCHIVER_ERR_PASSWORD || result == ARCHIVER_ERR_PASSWORD_REQUIRED) {
+      archiver_close(opened);
+      opened = nullptr;
+      continue;
+    }
+    if (result != ARCHIVER_OK) {
+      *out = opened;
+      return result;
+    }
+    PasswordState pw = password_from(passwords[i]);
+    std::string message;
+    ArchiverResult probed = probe_encrypted(opened->archive, pw, message);
+    if (probed == ARCHIVER_ERR_PASSWORD || probed == ARCHIVER_ERR_PASSWORD_REQUIRED) {
+      archiver_close(opened);
+      opened = nullptr;
+      continue;
+    }
+    if (probed != ARCHIVER_OK) {
+      if (!message.empty()) opened->message = message;
+      *out = opened;
+      return probed;
+    }
+    archiver_close(opened);
+    opened = nullptr;
+    result = archiver_open(archive_path, engine_path, passwords[i], &opened);
+    if (matched_index && result == ARCHIVER_OK) *matched_index = static_cast<int32_t>(i);
+    *out = opened;
+    return result;
+  }
+  result = archiver_open(archive_path, engine_path, nullptr, out);
+  if (result == ARCHIVER_OK && *out && (*out)->archive && archive_has_encrypted_item((*out)->archive)) {
+    (*out)->message = "password required";
+    return ARCHIVER_ERR_PASSWORD_REQUIRED;
+  }
+  return result;
+}
+
+ArchiverResult archiver_test(ArchiverArchive *archive, const char *password) {
+  if (!archive) return ARCHIVER_ERR_ARGUMENT;
+  if (!archive->archive) {
+    if (archive->message.empty()) archive->message = "archive is not open";
+    return ARCHIVER_ERR_FORMAT;
+  }
+  PasswordState pw = password_from(password);
+  archive->message.clear();
+  bool encrypted = archive_has_encrypted_item(archive->archive);
+  if (encrypted && !pw.provided) {
+    archive->message = "password required";
+    return ARCHIVER_ERR_PASSWORD_REQUIRED;
+  }
+  ExtractCtx ctx;
+  ctx.password = &pw;
+  ctx.message = &archive->message;
+  ExtractCallback *callback = new ExtractCallback();
+  callback->archive = archive->archive;
+  callback->ctx = &ctx;
+  CMyComPtr<IArchiveExtractCallback> held(callback);
+  UInt32 all = static_cast<UInt32>(-1);
+  HRESULT hr = archive->archive->Extract(nullptr, all, 1, held);
+  return from_extract(hr, ctx, pw, encrypted);
+}
+
+uint32_t crc32_bytes(const unsigned char *data, size_t n, uint32_t crc) {
+  static uint32_t table[256];
+  static bool ready = false;
+  if (!ready) {
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int bit = 0; bit < 8; ++bit) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      table[i] = c;
+    }
+    ready = true;
+  }
+  crc = ~crc;
+  for (size_t i = 0; i < n; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+  return ~crc;
+}
+
+void put_u16(unsigned char *p, uint16_t v) {
+  p[0] = static_cast<unsigned char>(v);
+  p[1] = static_cast<unsigned char>(v >> 8);
+}
+void put_u32(unsigned char *p, uint32_t v) {
+  p[0] = static_cast<unsigned char>(v);
+  p[1] = static_cast<unsigned char>(v >> 8);
+  p[2] = static_cast<unsigned char>(v >> 16);
+  p[3] = static_cast<unsigned char>(v >> 24);
+}
+
+FILE *open_write(const char *path) {
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path);
+  return _wfopen(wide.c_str(), L"wb");
+#else
+  return fopen(path, "wb");
+#endif
+}
+
+FILE *open_read(const char *path) {
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path);
+  return _wfopen(wide.c_str(), L"rb");
+#else
+  return fopen(path, "rb");
+#endif
+}
+
+ArchiverResult archiver_create_zip(const char *zip_path, const char *const *files, uint32_t file_count) {
+  if (!zip_path || !zip_path[0] || (!files && file_count)) return ARCHIVER_ERR_ARGUMENT;
+  struct Item {
+    std::string name;
+    uint32_t crc = 0;
+    uint32_t size = 0;
+    uint32_t offset = 0;
+  };
+  std::vector<Item> items;
+  for (uint32_t i = 0; i < file_count; ++i) {
+    if (!files[i] || !files[i][0]) return ARCHIVER_ERR_ARGUMENT;
+    Item item;
+    item.name = base_name_of(files[i]);
+    if (item.name.empty() || item.name == "." || item.name == ".." ||
+        item.name.find('/') != std::string::npos || item.name.find('\\') != std::string::npos) {
+      return ARCHIVER_ERR_PATH;
+    }
+    for (const Item &prev : items) {
+      if (prev.name == item.name) return ARCHIVER_ERR_ARGUMENT;
+    }
+    items.push_back(item);
+  }
+  FILE *out = open_write(zip_path);
+  if (!out) return ARCHIVER_ERR_IO;
+  bool ok = true;
+  for (uint32_t i = 0; i < file_count; ++i) {
+    FILE *in = open_read(files[i]);
+    if (!in) {
+      ok = false;
+      break;
+    }
+    std::string data;
+    char buf[8192];
+    while (ok) {
+      size_t n = fread(buf, 1, sizeof(buf), in);
+      if (n) data.append(buf, n);
+      if (n < sizeof(buf)) {
+        if (ferror(in)) ok = false;
+        break;
+      }
+      if (data.size() > kWriteCap) {
+        ok = false;
+        break;
+      }
+    }
+    fclose(in);
+    if (!ok) break;
+    items[i].crc = crc32_bytes(reinterpret_cast<const unsigned char *>(data.data()), data.size(), 0);
+    items[i].size = static_cast<uint32_t>(data.size());
+    items[i].offset = static_cast<uint32_t>(ftell(out));
+    unsigned char local[30];
+    memset(local, 0, sizeof(local));
+    put_u32(local, 0x04034b50u);
+    put_u16(local + 4, 20);
+    put_u16(local + 6, 1u << 11);
+    put_u32(local + 14, items[i].crc);
+    put_u32(local + 18, items[i].size);
+    put_u32(local + 22, items[i].size);
+    put_u16(local + 26, static_cast<uint16_t>(items[i].name.size()));
+    if (fwrite(local, 1, 30, out) != 30 ||
+        fwrite(items[i].name.data(), 1, items[i].name.size(), out) != items[i].name.size() ||
+        (data.size() && fwrite(data.data(), 1, data.size(), out) != data.size())) {
+      ok = false;
+    }
+  }
+  long central_at = ftell(out);
+  uint32_t central_size = 0;
+  for (const Item &item : items) {
+    unsigned char central[46];
+    memset(central, 0, sizeof(central));
+    put_u32(central, 0x02014b50u);
+    put_u16(central + 4, 20);
+    put_u16(central + 6, 20);
+    put_u16(central + 8, 1u << 11);
+    put_u32(central + 16, item.crc);
+    put_u32(central + 20, item.size);
+    put_u32(central + 24, item.size);
+    put_u16(central + 28, static_cast<uint16_t>(item.name.size()));
+    put_u32(central + 42, item.offset);
+    if (fwrite(central, 1, 46, out) != 46 ||
+        fwrite(item.name.data(), 1, item.name.size(), out) != item.name.size()) {
+      ok = false;
+      break;
+    }
+    central_size += 46u + static_cast<uint32_t>(item.name.size());
+  }
+  unsigned char end[22];
+  memset(end, 0, sizeof(end));
+  put_u32(end, 0x06054b50u);
+  put_u16(end + 8, static_cast<uint16_t>(items.size()));
+  put_u16(end + 10, static_cast<uint16_t>(items.size()));
+  put_u32(end + 12, central_size);
+  put_u32(end + 16, static_cast<uint32_t>(central_at));
+  if (fwrite(end, 1, 22, out) != 22) ok = false;
+  if (fclose(out) != 0) ok = false;
+  return ok ? ARCHIVER_OK : ARCHIVER_ERR_IO;
+}
+
+constexpr int kNestedDepthLimit = 8;
+constexpr uint64_t kNestedByteLimit = 4ull << 30;
+constexpr uint32_t kNestedFileLimit = 100000;
+constexpr uint64_t kNestedRatioLimit = 1000;
+constexpr uint64_t kNestedRatioFloor = 1ull << 20;
+
+struct NestedBudget {
+  int depth = 0;
+  uint64_t bytes = 0;
+  uint32_t files = 0;
+  std::vector<std::string> skip;
+};
+
+bool delete_file_at(const std::string &path) {
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path.c_str());
+  return ::DeleteFileW(wide.c_str()) != 0;
+#else
+  return ::unlink(path.c_str()) == 0;
+#endif
+}
+
+bool walk_regular_files(const std::string &root, const std::string &rel, std::vector<std::string> &out) {
+  std::string full = rel.empty() ? root : join_dir(root, rel);
+#if defined(_WIN32)
+  std::wstring pattern = utf8_to_wide((full + "\\*").c_str());
+  WIN32_FIND_DATAW data;
+  HANDLE handle = ::FindFirstFileW(pattern.c_str(), &data);
+  if (handle == INVALID_HANDLE_VALUE) return false;
+  do {
+    if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) continue;
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+    std::string name = wide_to_utf8(data.cFileName, wcslen(data.cFileName));
+    std::string child = rel.empty() ? name : rel + "/" + name;
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      if (!walk_regular_files(root, child, out)) {
+        ::FindClose(handle);
+        return false;
+      }
+    } else {
+      out.push_back(child);
+    }
+  } while (::FindNextFileW(handle, &data));
+  ::FindClose(handle);
+  return true;
+#else
+  DIR *dir = ::opendir(full.c_str());
+  if (!dir) return false;
+  while (dirent *ent = ::readdir(dir)) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+    std::string name = ent->d_name;
+    std::string child = rel.empty() ? name : rel + "/" + name;
+    std::string child_full = join_dir(full, name);
+    struct stat st;
+    if (::lstat(child_full.c_str(), &st) != 0) continue;
+    if (S_ISLNK(st.st_mode)) continue;
+    if (S_ISDIR(st.st_mode)) {
+      if (!walk_regular_files(root, child, out)) {
+        ::closedir(dir);
+        return false;
+      }
+    } else if (S_ISREG(st.st_mode)) {
+      out.push_back(child);
+    }
+  }
+  ::closedir(dir);
+  return true;
+#endif
+}
+
+ArchiverResult nested_extract(const std::string &path, const char *engine, const std::string &dest,
+                              const char *const *passwords, uint32_t password_count,
+                              const char *chosen, NestedBudget &budget, ArchiverProgressCallback progress,
+                              void *progress_user, std::string &message) {
+  if (budget.depth >= kNestedDepthLimit) {
+    message = "nested depth limit";
+    return ARCHIVER_ERR_LIMIT;
+  }
+  budget.skip.push_back(path);
+  int32_t matched = -1;
+  ArchiverArchive *archive = nullptr;
+  ArchiverResult opened =
+      archiver_open_with_passwords(path.c_str(), engine, passwords, password_count, &matched, &archive);
+  if (opened != ARCHIVER_OK) {
+    if (archive && !archive->message.empty()) message = archive->message;
+    else if (opened == ARCHIVER_ERR_PASSWORD_REQUIRED) message = "password required";
+    else if (opened == ARCHIVER_ERR_PASSWORD) message = "password rejected";
+    archiver_close(archive);
+    return opened;
+  }
+  uint64_t declared = 0;
+  uint32_t count = static_cast<uint32_t>(archive->entries.size());
+  for (const ListedEntry &entry : archive->entries) {
+    if (declared > kNestedByteLimit - entry.size) {
+      message = "output byte limit";
+      archiver_close(archive);
+      return ARCHIVER_ERR_LIMIT;
+    }
+    declared += entry.size;
+  }
+  if (budget.files > kNestedFileLimit - count) {
+    message = "file count limit";
+    archiver_close(archive);
+    return ARCHIVER_ERR_LIMIT;
+  }
+  if (budget.bytes > kNestedByteLimit - declared) {
+    message = "output byte limit";
+    archiver_close(archive);
+    return ARCHIVER_ERR_LIMIT;
+  }
+  uint64_t packed = 0;
+  if (!archive->source_path.empty()) file_size_of(archive->source_path, &packed);
+  if (declared >= kNestedRatioFloor && packed > 0 && declared / packed > kNestedRatioLimit) {
+    message = "compression ratio limit";
+    archiver_close(archive);
+    return ARCHIVER_ERR_LIMIT;
+  }
+  const char *password = nullptr;
+  std::string password_copy;
+  if (matched >= 0 && passwords && static_cast<uint32_t>(matched) < password_count &&
+      passwords[matched]) {
+    password_copy = passwords[matched];
+    password = password_copy.c_str();
+  }
+  ArchiverResult extracted =
+      archiver_extract_with_progress(archive, dest.c_str(), password, progress, progress_user);
+  if (extracted != ARCHIVER_OK) {
+    if (!archive->message.empty()) message = archive->message;
+    archiver_close(archive);
+    wipe_string(password_copy);
+    return extracted;
+  }
+  archiver_close(archive);
+  wipe_string(password_copy);
+  budget.bytes += declared;
+  budget.files += count;
+  budget.depth += 1;
+
+  std::vector<std::string> files;
+  if (!walk_regular_files(dest, std::string(), files)) {
+    message = "could not read extracted files";
+    return ARCHIVER_ERR_IO;
+  }
+  std::vector<std::string> archives;
+  for (const std::string &rel : files) {
+    if (rel.find("..") != std::string::npos) continue;
+    std::string full = join_dir(dest, rel);
+    bool skipped = false;
+    for (const std::string &prior : budget.skip) {
+      if (prior == full) skipped = true;
+    }
+    if (skipped) continue;
+    ArchiverArchive *inner = nullptr;
+    ArchiverResult trial = archiver_open(full.c_str(), engine, nullptr, &inner);
+    bool is_archive = trial == ARCHIVER_OK || trial == ARCHIVER_ERR_PASSWORD_REQUIRED ||
+                      trial == ARCHIVER_ERR_PASSWORD || trial == ARCHIVER_ERR_MISSING_VOLUME;
+    if (trial == ARCHIVER_OK && inner && inner->entries.empty()) is_archive = false;
+    archiver_close(inner);
+    if (is_archive) archives.push_back(rel);
+  }
+  if (archives.empty()) return ARCHIVER_OK;
+  std::string pick;
+  if (archives.size() == 1) {
+    pick = archives[0];
+  } else if (chosen && chosen[0]) {
+    for (const std::string &rel : archives) {
+      if (rel == chosen) pick = rel;
+    }
+    if (pick.empty()) {
+      message = "choose archive:";
+      for (const std::string &rel : archives) {
+        message.push_back('\n');
+        message += rel;
+      }
+      return ARCHIVER_ERR_NEED_CHOICE;
+    }
+  } else {
+    message = "choose archive:";
+    for (const std::string &rel : archives) {
+      message.push_back('\n');
+      message += rel;
+    }
+    return ARCHIVER_ERR_NEED_CHOICE;
+  }
+  std::string full = join_dir(dest, pick);
+  ArchiverResult deeper = nested_extract(full, engine, dest, passwords, password_count, nullptr, budget,
+                                          progress, progress_user, message);
+  if (deeper == ARCHIVER_OK) delete_file_at(full);
+  return deeper;
+}
+
+ArchiverResult archiver_extract_nested(const char *archive_path, const char *engine_path,
+                                       const char *dest_dir, const char *const *passwords,
+                                       uint32_t password_count, const char *chosen_inner,
+                                       ArchiverProgressCallback progress, void *progress_user,
+                                       char *message_buf, uint32_t message_cap) {
+  if (!archive_path || !archive_path[0] || !dest_dir || !dest_dir[0]) return ARCHIVER_ERR_ARGUMENT;
+  NestedBudget budget;
+  std::string message;
+  ArchiverResult result = nested_extract(archive_path, engine_path, dest_dir, passwords, password_count,
+                                          chosen_inner, budget, progress, progress_user, message);
+  copy_message(message_buf, message_cap, message);
+  return result;
 }
 
 void archiver_close(ArchiverArchive *archive) { delete archive; }

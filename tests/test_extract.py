@@ -231,11 +231,12 @@ def main():
         split = os.path.join(tmp, "vol.7z.001")
         with open(zip_path, "rb") as src, open(split, "wb") as dst:
             dst.write(src.read())
-        code, _, _ = run(cli, ["list", split, "--engine", engine])
-        if code != RESULT["unsupported"]:
-            errors += fail("split name should be unsupported")
+        code, out, err = run(cli, ["list", split, "--engine", engine])
+        if code != RESULT["format"]:
+            print(code, out, err, file=sys.stderr)
+            errors += fail("a zip renamed to .7z.001 is not a 7z volume")
         else:
-            print("ok split name rejected")
+            print("ok misnamed 7z volume rejected")
 
         slip = os.path.join(tmp, "slip.zip")
         with zipfile.ZipFile(slip, "w") as zf:

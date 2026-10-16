@@ -25,6 +25,11 @@ void wipe(std::string &s) {
   s.clear();
 }
 
+void wipe_bytes_local(void *data, size_t size) {
+  volatile unsigned char *p = static_cast<volatile unsigned char *>(data);
+  while (size--) *p++ = 0;
+}
+
 void print_result(ArchiverResult result, const ArchiverArchive *archive) {
   const char *detail = archiver_message(archive);
   switch (result) {
@@ -41,7 +46,19 @@ void print_result(ArchiverResult result, const ArchiverArchive *archive) {
       std::cout << "已拒绝不安全的路径。\n";
       break;
     case ARCHIVER_ERR_UNSUPPORTED:
-      std::cout << "这个文件不在第一阶段的范围内。\n";
+      std::cout << "这个文件打不开。\n";
+      break;
+    case ARCHIVER_ERR_MISSING_VOLUME:
+      std::cout << "缺少分卷。\n";
+      break;
+    case ARCHIVER_ERR_NEED_CHOICE:
+      std::cout << "这一层有多个压缩包，需要指定一个。\n";
+      break;
+    case ARCHIVER_ERR_LIMIT:
+      std::cout << "已达到嵌套解压上限。\n";
+      break;
+    case ARCHIVER_ERR_CANCELLED:
+      std::cout << "已取消。\n";
       break;
     case ARCHIVER_ERR_FORMAT:
       std::cout << "打不开这个压缩包。\n";
@@ -115,7 +132,12 @@ void usage() {
       << "用法:\n"
       << "  archiver-cli list <压缩包> [--engine 7z.so]\n"
       << "  archiver-cli extract <压缩包> <目标文件夹> [--engine 7z.so]\n"
+      << "  archiver-cli test <压缩包> [--engine 7z.so]\n"
+      << "  archiver-cli try-passwords <压缩包> <密码文件> [--engine 7z.so]\n"
+      << "  archiver-cli nested <压缩包> <目标文件夹> [密码文件] [--engine 7z.so]\n"
+      << "  archiver-cli create-zip <压缩包> <文件>... [--engine 7z.so]\n"
       << "需要密码时从键盘输入。密码不会写入文件，也不会出现在命令行参数里。\n"
+      << "try-passwords 只按文件里的顺序做头部校验，不会询问，也不会打印密码。\n"
       << "不会运行解压出来的程序。\n";
 }
 
@@ -127,9 +149,153 @@ const char *take_engine(int &i, int argc, char **argv) {
   return nullptr;
 }
 
+bool load_password_file(const char *path, std::vector<std::string> &out) {
+  FILE *file = fopen(path, "rb");
+  if (!file) return false;
+  std::string current;
+  char buf[256];
+  size_t n = 0;
+  while ((n = fread(buf, 1, sizeof(buf), file)) > 0) {
+    current.append(buf, n);
+    wipe_bytes_local(buf, n);
+  }
+  fclose(file);
+  std::string line;
+  for (char c : current) {
+    if (c == '\n') {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (!line.empty()) out.push_back(line);
+      wipe(line);
+    } else {
+      line.push_back(c);
+    }
+  }
+  if (!line.empty() && line.back() == '\r') line.pop_back();
+  if (!line.empty()) out.push_back(line);
+  wipe(line);
+  wipe(current);
+  return true;
+}
+
+const char *engine_after(int argc, char **argv, int index) {
+  const char *engine = nullptr;
+  for (int i = index; i < argc; ++i) {
+    const char *found = take_engine(i, argc, argv);
+    if (!found) return nullptr;
+    engine = found;
+  }
+  return engine;
+}
+
+int cmd_try_passwords(int argc, char **argv) {
+  if (argc < 4) {
+    usage();
+    return ARCHIVER_ERR_ARGUMENT;
+  }
+  const char *engine = engine_after(argc, argv, 4);
+  if (argc > 4 && !engine && strcmp(argv[4], "--engine") != 0) {
+    usage();
+    return ARCHIVER_ERR_ARGUMENT;
+  }
+  std::vector<std::string> passwords;
+  if (!load_password_file(argv[3], passwords)) return ARCHIVER_ERR_IO;
+  std::vector<const char *> views;
+  for (std::string &password : passwords) views.push_back(password.c_str());
+  int32_t matched = -1;
+  ArchiverArchive *archive = nullptr;
+  ArchiverResult result = archiver_open_with_passwords(
+      argv[2], engine, views.empty() ? nullptr : views.data(), static_cast<uint32_t>(views.size()),
+      &matched, &archive);
+  if (result == ARCHIVER_OK) std::cout << "matched " << matched << "\n";
+  else print_result(result, archive);
+  archiver_close(archive);
+  for (std::string &password : passwords) wipe(password);
+  return result;
+}
+
+int cmd_nested(int argc, char **argv) {
+  if (argc < 4) {
+    usage();
+    return ARCHIVER_ERR_ARGUMENT;
+  }
+  const char *password_file = nullptr;
+  const char *engine = nullptr;
+  for (int i = 4; i < argc; ++i) {
+    if (strcmp(argv[i], "--engine") == 0) {
+      if (i + 1 >= argc) return ARCHIVER_ERR_ARGUMENT;
+      engine = argv[++i];
+    } else if (!password_file) {
+      password_file = argv[i];
+    } else {
+      usage();
+      return ARCHIVER_ERR_ARGUMENT;
+    }
+  }
+  std::vector<std::string> passwords;
+  if (password_file && !load_password_file(password_file, passwords)) return ARCHIVER_ERR_IO;
+  std::vector<const char *> views;
+  for (std::string &password : passwords) views.push_back(password.c_str());
+  char message[1024];
+  message[0] = 0;
+  ArchiverResult result = archiver_extract_nested(
+      argv[2], engine, argv[3], views.empty() ? nullptr : views.data(),
+      static_cast<uint32_t>(views.size()), nullptr, nullptr, nullptr, message, sizeof(message));
+  print_result(result, nullptr);
+  if (message[0]) std::cout << message << "\n";
+  for (std::string &password : passwords) wipe(password);
+  return result;
+}
+
+int cmd_test_archive(int argc, char **argv) {
+  if (argc < 3) {
+    usage();
+    return ARCHIVER_ERR_ARGUMENT;
+  }
+  const char *engine = engine_after(argc, argv, 3);
+  std::string password;
+  ArchiverArchive *archive = nullptr;
+  ArchiverResult result = archiver_open(argv[2], engine, nullptr, &archive);
+  if (result == ARCHIVER_ERR_PASSWORD_REQUIRED) {
+    archiver_close(archive);
+    archive = nullptr;
+    if (!read_password(password)) return result;
+    result = archiver_open(argv[2], engine, password.c_str(), &archive);
+  }
+  if (result == ARCHIVER_OK) result = archiver_test(archive, password.empty() ? nullptr : password.c_str());
+  print_result(result, archive);
+  archiver_close(archive);
+  wipe(password);
+  return result;
+}
+
+int cmd_create_zip(int argc, char **argv) {
+  if (argc < 4) {
+    usage();
+    return ARCHIVER_ERR_ARGUMENT;
+  }
+  std::vector<const char *> files;
+  const char *engine = nullptr;
+  for (int i = 3; i < argc; ++i) {
+    if (strcmp(argv[i], "--engine") == 0) {
+      if (i + 1 >= argc) return ARCHIVER_ERR_ARGUMENT;
+      engine = argv[++i];
+      (void)engine;
+    } else {
+      files.push_back(argv[i]);
+    }
+  }
+  ArchiverResult result = archiver_create_zip(argv[2], files.data(), static_cast<uint32_t>(files.size()));
+  print_result(result, nullptr);
+  return result;
+}
+
 }  // namespace
 
 int run_main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "try-passwords") == 0) return cmd_try_passwords(argc, argv);
+  if (argc >= 2 && strcmp(argv[1], "nested") == 0) return cmd_nested(argc, argv);
+  if (argc >= 2 && strcmp(argv[1], "test") == 0) return cmd_test_archive(argc, argv);
+  if (argc >= 2 && strcmp(argv[1], "create-zip") == 0) return cmd_create_zip(argc, argv);
   if (argc < 3) {
     usage();
     return ARCHIVER_ERR_ARGUMENT;

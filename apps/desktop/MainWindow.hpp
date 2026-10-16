@@ -2,6 +2,7 @@
 #define LOCAL_ARCHIVER_MAIN_WINDOW_HPP
 #include <QMainWindow>
 #include <QString>
+#include <QVector>
 #include <memory>
 class ArchiveModel;
 class QLabel;
@@ -25,34 +26,45 @@ class MainWindow : public QMainWindow {
   void dropEvent(QDropEvent *event) override;
   void closeEvent(QCloseEvent *event) override;
  private:
+  void browseDirectory(const QString &path);
+  void enterArchiveFolder(const QString &prefix);
+  void goUp();
+  void activateRow(const QModelIndex &index);
   void chooseArchive();
-  void chooseDestination();
+  void addFiles();
+  void testArchive();
+  void showInfo();
+  void showPasswordBook();
   void startOpen(const QString &path, std::shared_ptr<DesktopSecret> secret = {});
-  void startExtract(const QString &dest, std::shared_ptr<DesktopSecret> secret = {});
+  void startExtract(const QString &dest, bool nested, std::shared_ptr<DesktopSecret> secret = {});
   void setBusy(bool busy, bool extracting = false);
   void refreshProgress();
   void cancelExtraction();
-  std::shared_ptr<DesktopSecret> askPassword(bool rejected);
+  std::shared_ptr<DesktopSecret> askPassword(bool rejected, bool *save);
   void showError(int result, const QString &detail);
+  void fillArchiveRows(const QVector<struct ArchiveRow> &rows);
   ArchiveModel *model_ = nullptr;
   QTableView *table_ = nullptr;
-  QLabel *archiveLabel_ = nullptr;
-  QLabel *summary_ = nullptr;
   QLabel *status_ = nullptr;
-  QLineEdit *destination_ = nullptr;
+  QLineEdit *pathBar_ = nullptr;
   QProgressBar *progress_ = nullptr;
   QPushButton *openButton_ = nullptr;
+  QPushButton *addButton_ = nullptr;
   QPushButton *extractButton_ = nullptr;
-  QPushButton *chooseButton_ = nullptr;
+  QPushButton *testButton_ = nullptr;
+  QPushButton *infoButton_ = nullptr;
+  QPushButton *upButton_ = nullptr;
   QPushButton *cancelButton_ = nullptr;
-  QPushButton *outputButton_ = nullptr;
   QTimer *timer_ = nullptr;
   std::shared_ptr<ArchiveSession> archive_;
   std::shared_ptr<DesktopWorkState> work_;
   QString archivePath_;
-  QString lastOutput_;
+  QString directory_;
+  QString archivePrefix_;
+  QVector<struct ArchiveRow> archiveRows_;
   bool busy_ = false;
   bool extracting_ = false;
   bool closeAfterFinish_ = false;
+  bool insideArchive_ = false;
 };
 #endif
