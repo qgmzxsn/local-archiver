@@ -1,0 +1,16 @@
+build/
+third_party/7zip/src/
+third_party/7zip/*.tar.xz
+third_party/7zip/*.7z
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.apk
+.DS_Store
+apps/android/.gradle/
+apps/android/local.properties
+apps/android/**/build/
+*.user
