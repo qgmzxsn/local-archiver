@@ -263,6 +263,15 @@ Kind classify(const std::string &path) {
   return Kind::Unsupported;
 }
 
+/* .mp4 rename, and a video or image with an archive glued on the end.
+   Not a general "any extension" scan, and not pixel steganography. */
+bool is_disguise_carrier(const std::string &path) {
+  std::string base = basename_lower(path);
+  return ends_with(base, ".mp4") || ends_with(base, ".m4v") || ends_with(base, ".mov") ||
+         ends_with(base, ".jpg") || ends_with(base, ".jpeg") || ends_with(base, ".png") ||
+         ends_with(base, ".gif") || ends_with(base, ".bmp") || ends_with(base, ".webp");
+}
+
 using CreateObjectFn = HRESULT(STDAPICALLTYPE *)(const GUID *, const GUID *, void **);
 using GetNumberOfFormatsFn = HRESULT(STDAPICALLTYPE *)(UInt32 *);
 using GetHandlerProperty2Fn = HRESULT(STDAPICALLTYPE *)(UInt32, PROPID, PROPVARIANT *);
@@ -461,56 +470,59 @@ class FileInStream Z7_final : public IInStream,
     if (fd >= 0) ::close(fd);
   }
 #endif
+  /* Visible range inside the real file. A renamed or appended archive is
+     opened as this slice so 7-Zip does not have to search the carrier. */
+  uint64_t view_base = 0;
+  uint64_t view_size = 0;
+  uint64_t view_pos = 0;
+
+  bool seek_phys(uint64_t pos) {
+#if defined(_WIN32)
+    LARGE_INTEGER move;
+    move.QuadPart = static_cast<LONGLONG>(pos);
+    return ::SetFilePointerEx(handle, move, nullptr, FILE_BEGIN) != 0;
+#else
+    return ::lseek(fd, static_cast<off_t>(pos), SEEK_SET) >= 0;
+#endif
+  }
 };
 
 Z7_COM7F_IMF(FileInStream::Read(void *data, UInt32 size, UInt32 *processedSize)) {
   if (processedSize) *processedSize = 0;
+  if (view_pos >= view_size) return S_OK;
+  uint64_t remain = view_size - view_pos;
+  uint32_t want = size;
+  if (static_cast<uint64_t>(want) > remain) want = static_cast<uint32_t>(remain);
+  if (want == 0) return S_OK;
+  if (!seek_phys(view_base + view_pos)) return E_FAIL;
 #if defined(_WIN32)
   DWORD got = 0;
-  if (!::ReadFile(handle, data, size, &got, nullptr)) return E_FAIL;
+  if (!::ReadFile(handle, data, want, &got, nullptr)) return E_FAIL;
+  view_pos += got;
   if (processedSize) *processedSize = static_cast<UInt32>(got);
 #else
-  ssize_t n = ::read(fd, data, size);
+  ssize_t n = ::read(fd, data, want);
   if (n < 0) return E_FAIL;
+  view_pos += static_cast<uint64_t>(n);
   if (processedSize) *processedSize = static_cast<UInt32>(n);
 #endif
   return S_OK;
 }
 
 Z7_COM7F_IMF(FileInStream::Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition)) {
-#if defined(_WIN32)
-  DWORD method = FILE_BEGIN;
-  if (seekOrigin == 1) method = FILE_CURRENT;
-  else if (seekOrigin == 2) method = FILE_END;
-  else if (seekOrigin != 0) return E_INVALIDARG;
-  LARGE_INTEGER move;
-  move.QuadPart = offset;
-  LARGE_INTEGER next;
-  next.QuadPart = 0;
-  if (!::SetFilePointerEx(handle, move, &next, method)) return HRESULT_WIN32_ERROR_NEGATIVE_SEEK;
-  if (newPosition) *newPosition = static_cast<UInt64>(next.QuadPart);
-#else
-  int whence = SEEK_SET;
-  if (seekOrigin == 1) whence = SEEK_CUR;
-  else if (seekOrigin == 2) whence = SEEK_END;
-  else if (seekOrigin != 0) return E_INVALIDARG;
-  off_t pos = ::lseek(fd, static_cast<off_t>(offset), whence);
-  if (pos < 0) return HRESULT_WIN32_ERROR_NEGATIVE_SEEK;
-  if (newPosition) *newPosition = static_cast<UInt64>(pos);
-#endif
+  int64_t next = 0;
+  if (seekOrigin == 0) next = offset;
+  else if (seekOrigin == 1) next = static_cast<int64_t>(view_pos) + offset;
+  else if (seekOrigin == 2) next = static_cast<int64_t>(view_size) + offset;
+  else return E_INVALIDARG;
+  if (next < 0) return HRESULT_WIN32_ERROR_NEGATIVE_SEEK;
+  view_pos = static_cast<uint64_t>(next);
+  if (newPosition) *newPosition = view_pos;
   return S_OK;
 }
 
 Z7_COM7F_IMF(FileInStream::GetSize(UInt64 *size)) {
-#if defined(_WIN32)
-  LARGE_INTEGER length;
-  if (!::GetFileSizeEx(handle, &length)) return E_FAIL;
-  *size = static_cast<UInt64>(length.QuadPart);
-#else
-  struct stat st;
-  if (::fstat(fd, &st) != 0) return E_FAIL;
-  *size = static_cast<UInt64>(st.st_size);
-#endif
+  *size = view_size;
   return S_OK;
 }
 
@@ -852,7 +864,7 @@ Z7_COM7F_IMF(ExtractCallback::CryptoGetTextPassword(BSTR *passwordOut)) {
   return *passwordOut ? S_OK : E_OUTOFMEMORY;
 }
 
-FileInStream *open_fd(const std::string &path) {
+FileInStream *open_fd(const std::string &path, uint64_t slice_base = 0) {
   FileInStream *stream = new FileInStream();
 #if defined(_WIN32)
   std::wstring wide = utf8_to_wide(path.c_str());
@@ -863,6 +875,12 @@ FileInStream *open_fd(const std::string &path) {
     return nullptr;
   }
   stream->handle = handle;
+  LARGE_INTEGER length;
+  if (!::GetFileSizeEx(handle, &length) || slice_base > static_cast<uint64_t>(length.QuadPart)) {
+    delete stream;
+    return nullptr;
+  }
+  stream->view_size = static_cast<uint64_t>(length.QuadPart) - slice_base;
 #else
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
@@ -870,8 +888,65 @@ FileInStream *open_fd(const std::string &path) {
     return nullptr;
   }
   stream->fd = fd;
+  struct stat st;
+  if (::fstat(fd, &st) != 0 || slice_base > static_cast<uint64_t>(st.st_size)) {
+    delete stream;
+    return nullptr;
+  }
+  stream->view_size = static_cast<uint64_t>(st.st_size) - slice_base;
 #endif
+  stream->view_base = slice_base;
+  stream->view_pos = 0;
   return stream;
+}
+
+bool read_at(const std::string &path, uint64_t offset, unsigned char *buf, size_t size, size_t *got) {
+  *got = 0;
+  if (size == 0) return true;
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path.c_str());
+  HANDLE handle = ::CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return false;
+  LARGE_INTEGER move;
+  move.QuadPart = static_cast<LONGLONG>(offset);
+  if (!::SetFilePointerEx(handle, move, nullptr, FILE_BEGIN)) {
+    ::CloseHandle(handle);
+    return false;
+  }
+  DWORD n = 0;
+  BOOL ok = ::ReadFile(handle, buf, static_cast<DWORD>(size), &n, nullptr);
+  ::CloseHandle(handle);
+  if (!ok) return false;
+  *got = n;
+#else
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  ssize_t n = ::pread(fd, buf, size, static_cast<off_t>(offset));
+  ::close(fd);
+  if (n < 0) return false;
+  *got = static_cast<size_t>(n);
+#endif
+  return true;
+}
+
+bool file_size_of(const std::string &path, uint64_t *size) {
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path.c_str());
+  HANDLE handle = ::CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return false;
+  LARGE_INTEGER length;
+  BOOL ok = ::GetFileSizeEx(handle, &length);
+  ::CloseHandle(handle);
+  if (!ok || length.QuadPart < 0) return false;
+  *size = static_cast<uint64_t>(length.QuadPart);
+#else
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return false;
+  *size = static_cast<uint64_t>(st.st_size);
+#endif
+  return true;
 }
 
 bool read_prefix(const std::string &path, unsigned char *buf, size_t size, size_t *got) {
@@ -964,8 +1039,9 @@ bool make_temp_dir(std::string &out) {
 
 ArchiverResult open_with(EngineLib &lib, const GUID &clsid, const std::string &path,
                          PasswordState &password, CMyComPtr<IInArchive> &archive,
-                         CMyComPtr<IInStream> &stream, std::string &message) {
-  FileInStream *raw = open_fd(path);
+                         CMyComPtr<IInStream> &stream, std::string &message,
+                         uint64_t slice_base = 0) {
+  FileInStream *raw = open_fd(path, slice_base);
   if (!raw) {
     message = "could not open archive file";
     return ARCHIVER_ERR_IO;
@@ -1279,6 +1355,200 @@ ArchiverResult archiver_check_symlink(const char *link_path, const char *target)
   return checked.reject == archiver::PathReject::Ok ? ARCHIVER_OK : ARCHIVER_ERR_PATH;
 }
 
+bool bytes_eq(const unsigned char *p, const char *lit, size_t n) {
+  return memcmp(p, lit, n) == 0;
+}
+
+bool is_zip_local(const unsigned char *p) {
+  return p[0] == 'P' && p[1] == 'K' && p[2] == 3 && p[3] == 4;
+}
+bool is_7z_sig(const unsigned char *p) {
+  return bytes_eq(p, "\x37\x7A\xBC\xAF\x27\x1C", 6);
+}
+bool is_rar_sig(const unsigned char *p) {
+  return bytes_eq(p, "Rar!\x1A\x07", 6);
+}
+
+uint32_t read_u32(const unsigned char *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+uint16_t read_u16(const unsigned char *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+bool guid_for_kind(EngineLib &lib, Kind kind, const std::string &path, uint64_t offset, GUID &out,
+                   std::string &message) {
+  if (kind == Kind::Rar) {
+    unsigned char sig[8];
+    memset(sig, 0, sizeof(sig));
+    size_t n = 0;
+    if (!read_at(path, offset, sig, sizeof(sig), &n)) {
+      message = "could not open archive file";
+      return false;
+    }
+    bool rar5 = n >= 8 && is_rar_sig(sig) && sig[6] == 1;
+    if (find_handler(lib, rar5 ? "Rar5" : "Rar", out)) return true;
+    message = "7-Zip library has no RAR handler";
+    return false;
+  }
+  const char *name = outer_name(kind);
+  if (!name[0] || !find_handler(lib, name, out)) {
+    message = "7-Zip library has no handler for this extension";
+    return false;
+  }
+  return true;
+}
+
+void close_open_archive(ArchiverArchive *archive) {
+  if (archive->archive) archive->archive->Close();
+  archive->archive.Release();
+  archive->stream.Release();
+  archive->entries.clear();
+}
+
+/* Open one candidate and keep it only when the handler can list at least one file.
+   A signature match alone is not enough. */
+ArchiverResult try_listed_archive(ArchiverArchive *archive, Kind kind, const std::string &path,
+                                  uint64_t offset, PasswordState &password) {
+  GUID clsid;
+  if (!guid_for_kind(archive->engine, kind, path, offset, clsid, archive->message)) {
+    return ARCHIVER_ERR_ENGINE;
+  }
+  ArchiverResult opened = open_with(archive->engine, clsid, path, password, archive->archive,
+                                     archive->stream, archive->message, offset);
+  if (opened != ARCHIVER_OK) return opened;
+  std::vector<ListedEntry> probe;
+  std::string message;
+  ArchiverResult listed = read_entries(archive->archive, probe, message);
+  if (listed == ARCHIVER_OK && !probe.empty()) {
+    archive->message.clear();
+    return ARCHIVER_OK;
+  }
+  close_open_archive(archive);
+  if (listed == ARCHIVER_ERR_PATH || listed == ARCHIVER_ERR_PASSWORD ||
+      listed == ARCHIVER_ERR_PASSWORD_REQUIRED || listed == ARCHIVER_ERR_UNSUPPORTED) {
+    archive->message = message;
+    return listed;
+  }
+  return ARCHIVER_ERR_FORMAT;
+}
+
+struct SliceHit {
+  Kind kind;
+  uint64_t offset;
+};
+
+void remember_hit(std::vector<SliceHit> &hits, Kind kind, uint64_t offset) {
+  for (const SliceHit &hit : hits) {
+    if (hit.kind == kind && hit.offset == offset) return;
+  }
+  hits.push_back(SliceHit{kind, offset});
+}
+
+bool zip_start_from_eocd(const std::string &path, uint64_t file_size, uint64_t *start) {
+  if (file_size < 22) return false;
+  uint64_t tail = file_size < (65535ull + 22ull) ? file_size : (65535ull + 22ull);
+  std::vector<unsigned char> end(static_cast<size_t>(tail));
+  size_t got = 0;
+  if (!read_at(path, file_size - tail, end.data(), static_cast<size_t>(tail), &got) || got < 22) {
+    return false;
+  }
+  for (size_t i = got - 22;; --i) {
+    if (end[i] == 'P' && end[i + 1] == 'K' && end[i + 2] == 5 && end[i + 3] == 6) {
+      uint16_t comment = read_u16(end.data() + i + 20);
+      uint64_t eocd = (file_size - got) + i;
+      if (eocd + 22ull + comment == file_size) {
+        uint32_t cd_size = read_u32(end.data() + i + 12);
+        uint32_t cd_off = read_u32(end.data() + i + 16);
+        int64_t origin = static_cast<int64_t>(eocd) - static_cast<int64_t>(cd_size) -
+                         static_cast<int64_t>(cd_off);
+        if (origin > 0 && static_cast<uint64_t>(origin) < file_size) {
+          *start = static_cast<uint64_t>(origin);
+          return true;
+        }
+      }
+    }
+    if (i == 0) break;
+  }
+  return false;
+}
+
+void scan_appended_signatures(const std::string &path, uint64_t file_size, std::vector<SliceHit> &jpeg,
+                              std::vector<SliceHit> &tail) {
+  const uint64_t overlap = 16;
+  std::vector<unsigned char> buf(1u << 20);
+  uint64_t pos = 0;
+  while (pos < file_size) {
+    size_t want = buf.size();
+    if (file_size - pos < want) want = static_cast<size_t>(file_size - pos);
+    size_t got = 0;
+    if (!read_at(path, pos, buf.data(), want, &got) || got < 6) break;
+    for (size_t i = 0; i + 6 <= got; ++i) {
+      uint64_t off = pos + i;
+      if (off == 0) continue;
+      const unsigned char *p = buf.data() + i;
+      if (is_7z_sig(p)) remember_hit(tail, Kind::SevenZ, off);
+      else if (i + 7 <= got && is_rar_sig(p)) remember_hit(tail, Kind::Rar, off);
+      if (p[0] == 0xFF && p[1] == 0xD9) {
+        const unsigned char *next = p + 2;
+        uint64_t after = off + 2;
+        if (i + 6 <= got && is_zip_local(next)) remember_hit(jpeg, Kind::Zip, after);
+        else if (i + 8 <= got && is_7z_sig(next)) remember_hit(jpeg, Kind::SevenZ, after);
+        else if (i + 9 <= got && is_rar_sig(next)) remember_hit(jpeg, Kind::Rar, after);
+      }
+    }
+    if (pos + got >= file_size) break;
+    uint64_t step = got > overlap ? got - overlap : got;
+    if (step == 0) break;
+    pos += step;
+  }
+  if (tail.size() > 32) tail.erase(tail.begin(), tail.end() - 32);
+}
+
+ArchiverResult open_disguised(ArchiverArchive *archive, const std::string &path, PasswordState &password) {
+  std::vector<SliceHit> hits;
+  unsigned char head[8];
+  memset(head, 0, sizeof(head));
+  size_t head_n = 0;
+  read_at(path, 0, head, sizeof(head), &head_n);
+  if (head_n >= 4 && is_zip_local(head)) remember_hit(hits, Kind::Zip, 0);
+  else if (head_n >= 6 && is_7z_sig(head)) remember_hit(hits, Kind::SevenZ, 0);
+  else if (head_n >= 7 && is_rar_sig(head)) remember_hit(hits, Kind::Rar, 0);
+
+  uint64_t file_size = 0;
+  if (!file_size_of(path, &file_size)) {
+    archive->message = "could not open archive file";
+    return ARCHIVER_ERR_IO;
+  }
+  uint64_t zip_at = 0;
+  if (zip_start_from_eocd(path, file_size, &zip_at)) remember_hit(hits, Kind::Zip, zip_at);
+
+  std::vector<SliceHit> jpeg;
+  std::vector<SliceHit> tail;
+  /* Header hits are enough for a renamed file. Still scan when the header is
+     media, and also when a header match might be a false start before a real tail. */
+  if (hits.empty() || hits[0].offset != 0) {
+    scan_appended_signatures(path, file_size, jpeg, tail);
+    for (const SliceHit &hit : jpeg) remember_hit(hits, hit.kind, hit.offset);
+    for (size_t i = tail.size(); i > 0; --i) remember_hit(hits, tail[i - 1].kind, tail[i - 1].offset);
+  }
+
+  if (hits.empty()) {
+    archive->message = "no archive in this file";
+    return ARCHIVER_ERR_UNSUPPORTED;
+  }
+  for (const SliceHit &hit : hits) {
+    ArchiverResult result = try_listed_archive(archive, hit.kind, path, hit.offset, password);
+    if (result == ARCHIVER_OK) return ARCHIVER_OK;
+    if (result == ARCHIVER_ERR_PASSWORD_REQUIRED || result == ARCHIVER_ERR_PASSWORD ||
+        result == ARCHIVER_ERR_PATH) {
+      return result;
+    }
+  }
+  archive->message = "no archive in this file";
+  return ARCHIVER_ERR_UNSUPPORTED;
+}
+
 ArchiverResult archiver_open(const char *archive_path, const char *engine_path, const char *password,
                              ArchiverArchive **out) {
   if (!out) return ARCHIVER_ERR_ARGUMENT;
@@ -1286,7 +1556,12 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
   if (!archive_path || !archive_path[0]) return ARCHIVER_ERR_ARGUMENT;
 
   Kind kind = classify(archive_path);
-  if (kind == Kind::Split || kind == Kind::Unsupported) return ARCHIVER_ERR_UNSUPPORTED;
+  if (kind == Kind::Split) return ARCHIVER_ERR_UNSUPPORTED;
+  bool disguise = false;
+  if (kind == Kind::Unsupported) {
+    if (!is_disguise_carrier(archive_path)) return ARCHIVER_ERR_UNSUPPORTED;
+    disguise = true;
+  }
 
   std::unique_ptr<ArchiverArchive> archive(new ArchiverArchive());
   PasswordState pw = password_from(password);
@@ -1296,7 +1571,9 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
   }
 
   ArchiverResult result = ARCHIVER_OK;
-  if (kind == Kind::TarGz || kind == Kind::TarBz2 || kind == Kind::TarXz || kind == Kind::TarZst) {
+  if (disguise) {
+    result = open_disguised(archive.get(), archive_path, pw);
+  } else if (kind == Kind::TarGz || kind == Kind::TarBz2 || kind == Kind::TarXz || kind == Kind::TarZst) {
     result = open_kind(archive.get(), kind, archive_path, pw);
     if (result == ARCHIVER_OK) {
       if (!make_temp_dir(archive->temp_dir)) {
@@ -1334,7 +1611,7 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
     result = open_kind(archive.get(), kind, archive_path, pw);
   }
 
-  if (result == ARCHIVER_OK) {
+  if (result == ARCHIVER_OK && archive->entries.empty()) {
     result = read_entries(archive->archive, archive->entries, archive->message);
     if (result != ARCHIVER_OK) {
       if (archive->archive) archive->archive->Close();
