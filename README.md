@@ -2,6 +2,8 @@
 
 这是一个打开本机压缩包的 Windows 程序。它不下载任何东西。
 
+当前 Windows 下载是 [v0.3.0](https://github.com/qgmzxsn/local-archiver/releases/tag/v0.3.0)。
+
 ## 能做什么
 
 - ZIP、7z，以及用 gz、bz2、xz、zstd 压缩的 tar
@@ -11,9 +13,9 @@
 - 一层嵌套解压。密码不对、缺卷、同一层有好几个压缩包，或超过大小限制时会停下来
 - 本机密码本，先试已经保存的密码
 
-## 还不要当成已经完成
+## 还不包括
 
-GitHub Release v0.2.0 是更早的 Windows 安装包，不包含后来的修正。目前还没有更新的 GitHub Release。Mac 没有发布。Android 暂停。像素隐写、创建 RAR、破解密码、网盘和磁力链接都不做。
+Mac 没有发布。Android 暂停。像素隐写、创建 RAR、破解密码、网盘和磁力链接都不做。
 
 ## 许可证
 
