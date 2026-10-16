@@ -1,4 +1,12 @@
-# 本地归档（第一阶段）
+# 本地归档
+
+Windows 图形版当前版本：**0.2.0**。可以打开或拖入本机压缩包、查看文件列表、选择输出目录，再点击“开始解压”。解压在后台进行，显示进度并支持取消。
+
+普通用户使用 Windows 安装包（`setup.exe`）或便携包（`portable.zip`）。便携包需要先把整个文件夹解压出来，再双击 `local-archiver.exe`；不需要安装 Qt、7-Zip 或开发工具。源码 ZIP 供开发使用，不能直接当程序运行。
+
+下载 **0.2.0**：[Windows 安装版](https://github.com/qgmzxsn/local-archiver/releases/download/v0.2.0/LocalArchiver-0.2.0-windows-x64-setup.exe) · [Windows 便携版](https://github.com/qgmzxsn/local-archiver/releases/download/v0.2.0/LocalArchiver-0.2.0-windows-x64-portable.zip) · [完整发布页与源码](https://github.com/qgmzxsn/local-archiver/releases/tag/v0.2.0)。
+
+Windows 发布与构建方法见 `packaging/windows/RELEASING.md`。GitHub 发布时，二进制安装包/便携包放在 Releases，源码保留在仓库；生成本地安装包不会自动上传 GitHub。
 
 这是一个打开本机压缩包的小工具。Windows、macOS、Android 各是一个独立应用，共用同一份 C++ 内核。它不联网，也不把任务或设置带到另一台设备。
 
@@ -11,9 +19,11 @@
 - tar，以及 tar.gz、tar.bz2、tar.xz、tar.zst（也认 tgz、tbz2、tbz、txz、tzst 这些后缀）
 - RAR 和 RAR5，只能解压，不能创建
 
-需要密码时，由你当场输入。程序不把密码写进文件，也不写进日志。
+需要密码时，由你当场输入。桌面版只在本次打开期间把密码保留在内存中，更换压缩包或关闭窗口后清除；程序不把密码写进文件，也不写进日志。
 
 解压时会拒绝这些路径：`..`、绝对路径、指到目标文件夹外面的符号链接。不会运行解压出来的程序。
+
+目标位置已有同名文件时会停止并保留原文件，不会自动覆盖。密码错误或校验失败时会清理当前未完成的文件；之前已经成功解压的文件和新建目录可能保留。Windows 还会拒绝输出路径中的目录联接、符号链接及设备名（如 `NUL`、`CON.txt`）。Windows 暂不创建压缩包中的符号链接。
 
 ## 第一阶段不做什么
 
@@ -77,6 +87,36 @@ gradle assembleDebug
 - Android 安装包不会放进 git。调试 APK 由 `apps/android` 里的 Gradle 打出来，库来自 `build-android/arm64-v8a`。
 
 不要把没编过的应用当成已经完成。
+
+## 本轮修复与 Windows 验证（2026-10-16）
+
+已在真实 Windows 上，用便携 MinGW-w64 工具链编译内核、命令行及宿主 JNI 测试库，并连接官方 7-Zip 26.04 `7z.dll` 执行回归。修复了：
+
+- Windows COM 字符串分配器不匹配，导致打开普通 ZIP 就出现堆损坏并退出。
+- Windows 写入时跟随已有目录联接，导致解压文件落到目标目录外；改成基于目录句柄逐层打开并拒绝重解析点。
+- 静默覆盖已有文件，以及错误密码/CRC 失败留下当前不完整文件的问题。
+- Windows 命令行的中文、emoji 路径及交互式密码回显。
+- JNI 把 Java modified UTF-8 当作 UTF-8、把 UTF-16 代理项分开编码，导致补充平面字符乱码的问题。
+- Android 缓存文件丢失扩展名导致所有格式被拒绝；现在保留原文件名和复合扩展名，复制失败也不会替换之前打开的文件。
+- 桌面端打开新压缩包后取消密码输入，仍显示上一份文件列表的问题。
+- 部分解压错误状态被忽略，以及未加密文件损坏被误报为密码错误的问题。
+
+原有 `scripts/build-windows*.sh` 仍是 Linux 交叉编译入口。在 Windows 上可使用便携 MinGW-w64（含 CMake 和 make），下载并校验 `scripts/fetch-7zip.sh` 指定的源码后，直接运行 CMake。以下路径需要换成自己的绝对路径：
+
+```powershell
+cmake -S . -B build-windows -G "MinGW Makefiles" `
+  -DSEVENZIP_SRC=C:/deps/7zip-src `
+  -DCMAKE_CXX_COMPILER=g++ `
+  -DARCHIVER_TEST_ENGINE=C:/deps/7zip/7z.dll `
+  -DARCHIVER_TEST_7Z=C:/deps/7zip/7z.exe `
+  -DARCHIVER_TEST_JNI=ON
+cmake --build build-windows -j 6
+ctest --test-dir build-windows --output-on-failure
+```
+
+`ARCHIVER_TEST_ENGINE` 启用实际解压回归；`ARCHIVER_TEST_7Z` 可选，用于生成 7z 加密样本。宿主 JNI 回归需要 Python 3.9+、JDK 11+，用于验证 JNI 的文件名、路径和密码转换，不代表 Android 安装包或真机验证。没有 JDK 时可不设置 `ARCHIVER_TEST_JNI`。命令行运行时，把 `7z.dll` 放在 `libarchiver.dll` 旁边，或显式传 `--engine`。
+
+上述第一轮修复之后，Windows Qt 图形界面也已用匹配的 Qt 6.8.3 / MinGW 13.1 原生编译并运行，并完成打开、解压、密码与取消操作的 Qt 自动回归。没有构建/运行 Android APK，未重新验证 Linux/macOS。RAR4、RAR5 本轮没有样本回归。Windows 控制台密码不回显的分支已编译，自动测试使用重定向输入，没有模拟真人终端输入。
 
 ## 许可证
 

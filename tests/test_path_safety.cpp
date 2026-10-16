@@ -40,6 +40,20 @@ int main() {
   expect_path("foo/\x01 bar", 0);
   expect_path("", 0);
   expect_path(".", 0);
+#if defined(_WIN32)
+  expect_path("sub/.. /outside", 0);
+  expect_path("sub/name.", 0);
+  expect_path("CON.txt", 0);
+  expect_path("sub/nul", 0);
+  expect_path("LPT9.log", 0);
+  expect_path("COM1", 0);
+  expect_path("NUL .txt", 0);
+  expect_path("COM\xc2\xb9.txt", 0);
+  expect_path("CONOUT$", 0);
+  expect_path("sub/a?b", 0);
+  expect_path("console.txt", 1);
+  expect_path("COM10.txt", 1);
+#endif
 
   expect_link("dir/link", "file.txt", 1);
   expect_link("dir/link", "../dir/file.txt", 1);

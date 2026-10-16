@@ -1,10 +1,12 @@
 #include "archiver.h"
+#include "utf.hpp"
 
 #include <jni.h>
 
 #include <string.h>
 
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -22,30 +24,26 @@ std::string from_chars(JNIEnv *env, jcharArray chars) {
   if (n <= 0) return std::string();
   jchar *data = env->GetCharArrayElements(chars, nullptr);
   if (!data) return std::string();
-  std::wstring wide(data, data + n);
+  std::string out = archiver::utf16_to_utf8(data, static_cast<size_t>(n));
+  volatile jchar *clear = data;
+  for (jsize i = 0; i < n; ++i) clear[i] = 0;
   env->ReleaseCharArrayElements(chars, data, JNI_ABORT);
-  std::string out;
-  for (wchar_t ch : wide) {
-    uint32_t cp = static_cast<uint32_t>(ch);
-    if (cp < 0x80) out.push_back(static_cast<char>(cp));
-    else if (cp < 0x800) {
-      out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    } else {
-      out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    }
-  }
   return out;
 }
 
 std::string from_jstring(JNIEnv *env, jstring value) {
   if (!value) return std::string();
-  const char *utf = env->GetStringUTFChars(value, nullptr);
-  std::string out = utf ? utf : "";
-  if (utf) env->ReleaseStringUTFChars(value, utf);
+  const jchar *chars = env->GetStringChars(value, nullptr);
+  if (!chars) return std::string();
+  std::string out = archiver::utf16_to_utf8(chars, env->GetStringLength(value));
+  env->ReleaseStringChars(value, chars);
   return out;
+}
+
+jstring to_jstring(JNIEnv *env, const std::string &value) {
+  std::u16string text = archiver::utf8_to_utf16(value);
+  std::vector<jchar> chars(text.begin(), text.end());
+  return env->NewString(chars.data(), static_cast<jsize>(chars.size()));
 }
 
 jstring result_text(JNIEnv *env, ArchiverResult result, ArchiverArchive *archive) {
@@ -55,7 +53,7 @@ jstring result_text(JNIEnv *env, ArchiverResult result, ArchiverArchive *archive
     text.push_back('\n');
     text += detail;
   }
-  return env->NewStringUTF(text.c_str());
+  return to_jstring(env, text);
 }
 
 }  // namespace
@@ -66,6 +64,7 @@ Java_app_localarchiver_ArchiverNative_listArchive(JNIEnv *env, jobject, jstring 
   std::string path = from_jstring(env, archive_path);
   std::string engine = from_jstring(env, engine_path);
   std::string pw = from_chars(env, password);
+  if (env->ExceptionCheck()) { wipe(pw); return nullptr; }
   const char *pw_ptr = password ? pw.c_str() : nullptr;
   ArchiverArchive *archive = nullptr;
   ArchiverResult result =
@@ -88,7 +87,7 @@ Java_app_localarchiver_ArchiverNative_listArchive(JNIEnv *env, jobject, jstring 
     archiver_entry_free(&entry);
   }
   archiver_close(archive);
-  return env->NewStringUTF(text.c_str());
+  return to_jstring(env, text);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -99,6 +98,7 @@ Java_app_localarchiver_ArchiverNative_extractArchive(JNIEnv *env, jobject, jstri
   std::string dest = from_jstring(env, dest_path);
   std::string engine = from_jstring(env, engine_path);
   std::string pw = from_chars(env, password);
+  if (env->ExceptionCheck()) { wipe(pw); return nullptr; }
   const char *pw_ptr = password ? pw.c_str() : nullptr;
   ArchiverArchive *archive = nullptr;
   ArchiverResult result =

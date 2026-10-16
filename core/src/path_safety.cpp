@@ -62,6 +62,27 @@ CheckedPath check_entry_path(const std::string &raw) {
     if (part.empty() || part == ".") continue;
     if (part == "..") return fail(PathReject::DotDot);
     if (part.find(':') != std::string::npos) return fail(PathReject::Absolute);
+#if defined(_WIN32)
+    // Reject Win32 aliases and device names rather than creating ambiguous
+    // names that Explorer or another application could resolve differently.
+    if (part.back() == '.' || part.back() == ' ' ||
+        part.find_first_of("<>\"|?*") != std::string::npos) {
+      return fail(PathReject::WindowsName);
+    }
+    std::string stem = part.substr(0, part.find('.'));
+    while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+    for (char &c : stem) if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+    if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" ||
+        stem == "CONIN$" || stem == "CONOUT$" ||
+        ((stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) &&
+         (stem.substr(3) == "\xc2\xb9" || stem.substr(3) == "\xc2\xb2" ||
+          stem.substr(3) == "\xc2\xb3")) ||
+        (stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 ||
+                              stem.compare(0, 3, "LPT") == 0) &&
+         stem[3] >= '1' && stem[3] <= '9')) {
+      return fail(PathReject::WindowsName);
+    }
+#endif
     kept.push_back(part);
   }
   if (kept.empty()) return fail(PathReject::Empty);
@@ -123,6 +144,7 @@ const char *path_reject_string(PathReject reject) {
     case PathReject::Control: return "control-character";
     case PathReject::Escapes: return "symlink-escapes";
     case PathReject::TooLong: return "path-too-long";
+    case PathReject::WindowsName: return "windows-name";
   }
   return "path";
 }

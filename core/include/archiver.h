@@ -21,7 +21,7 @@ extern "C" {
 #  define ARCHIVER_API __attribute__((visibility("default")))
 #endif
 
-#define ARCHIVER_VERSION "0.1.0"
+#define ARCHIVER_VERSION "0.2.0"
 
 typedef enum ArchiverResult {
   ARCHIVER_OK = 0,
@@ -32,7 +32,8 @@ typedef enum ArchiverResult {
   ARCHIVER_ERR_PASSWORD_REQUIRED = 5,
   ARCHIVER_ERR_PASSWORD = 6,
   ARCHIVER_ERR_PATH = 7,
-  ARCHIVER_ERR_UNSUPPORTED = 8
+  ARCHIVER_ERR_UNSUPPORTED = 8,
+  ARCHIVER_ERR_CANCELLED = 9
 } ArchiverResult;
 
 typedef struct ArchiverArchive ArchiverArchive;
@@ -65,6 +66,15 @@ ARCHIVER_API void archiver_entry_free(ArchiverEntry *entry);
 ARCHIVER_API ArchiverResult archiver_extract(ArchiverArchive *archive,
                                               const char *dest_dir,
                                               const char *password);
+
+/* Runs synchronously on the caller's thread. The callback must not call back
+   into this archive. Return nonzero to cancel; the current incomplete file is
+   removed, while completed files/directories may remain. No callback is kept
+   after this function returns. total may be zero when it is not yet known. */
+typedef int (*ArchiverProgressCallback)(uint64_t completed, uint64_t total, void *user);
+ARCHIVER_API ArchiverResult archiver_extract_with_progress(
+    ArchiverArchive *archive, const char *dest_dir, const char *password,
+    ArchiverProgressCallback progress, void *user);
 
 ARCHIVER_API void archiver_close(ArchiverArchive *archive);
 

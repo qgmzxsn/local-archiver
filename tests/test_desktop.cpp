@@ -1,0 +1,138 @@
+#include "MainWindow.hpp"
+#include <QApplication>
+#include <QDir>
+#include <QFile>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QProcess>
+#include <QPushButton>
+#include <QTableView>
+#include <QTemporaryDir>
+#include <QTimer>
+#include <QUuid>
+#include <QtTest>
+
+static QString sevenZip;
+static QString engine;
+
+class DesktopTests : public QObject {
+  Q_OBJECT
+ private:
+  bool makeArchive(const QString &directory, const QString &archive,
+                   const QByteArray &data, const QString &password = {}) {
+    QFile file(directory + "/hello.txt");
+    if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size()) return false;
+    file.close();
+    QProcess process;
+    process.setWorkingDirectory(directory);
+    QStringList args{"a", archive.endsWith(".zip") ? "-tzip" : "-t7z", archive, "hello.txt"};
+    if (!password.isEmpty()) args << "-p" + password << "-mhe=on";
+    process.start(sevenZip, args);
+    return process.waitForFinished(15000) && process.exitCode() == 0;
+  }
+ private slots:
+  void initTestCase() { qputenv("ARCHIVER_7ZIP", engine.toUtf8()); }
+  void openAndExtract() {
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString path = temp.path() + QStringLiteral("/测试😀.zip");
+    QVERIFY(makeArchive(temp.path(), path, "gui contents"));
+    MainWindow window;
+    auto *extract = window.findChild<QPushButton *>("extractButton");
+    QVERIFY(!extract->isEnabled());
+    window.openPath(path);
+    QVERIFY(window.isBusy());
+    QVERIFY(!window.findChild<QPushButton *>("openButton")->isEnabled());
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 1);
+    QVERIFY(extract->isEnabled());
+    const QString dest = temp.path() + QStringLiteral("/输出😀");
+    window.findChild<QLineEdit *>("destinationEdit")->setText(dest);
+    extract->click();
+    QVERIFY(window.isBusy());
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QFile output(dest + "/hello.txt");
+    QVERIFY(output.open(QIODevice::ReadOnly));
+    QCOMPARE(output.readAll(), QByteArray("gui contents"));
+    QVERIFY(window.findChild<QLabel *>("statusLabel")->text().contains(QStringLiteral("解压完成")));
+  }
+  void encryptedArchiveUsesOneSessionPassword() {
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString password = QUuid::createUuid().toString() + QStringLiteral("🔑");
+    const QString path = temp.path() + "/encrypted.7z";
+    QVERIFY(makeArchive(temp.path(), path, "secret", password));
+    int prompts = 0;
+    QTimer answer;
+    connect(&answer, &QTimer::timeout, [&] {
+      if (auto *dialog = qobject_cast<QInputDialog *>(QApplication::activeModalWidget())) {
+        ++prompts;
+        dialog->setTextValue(password);
+        dialog->accept();
+      }
+    });
+    answer.start(10);
+    MainWindow window;
+    window.openPath(path);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QCOMPARE(prompts, 1);
+    const QString dest = temp.path() + "/out";
+    window.findChild<QLineEdit *>("destinationEdit")->setText(dest);
+    window.findChild<QPushButton *>("extractButton")->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QCOMPARE(prompts, 1);
+    QFile output(dest + "/hello.txt");
+    QVERIFY(output.open(QIODevice::ReadOnly));
+    QCOMPARE(output.readAll(), QByteArray("secret"));
+  }
+  void cancelKeepsUiUsable() {
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString path = temp.path() + "/cancel.zip";
+    QVERIFY(makeArchive(temp.path(), path, QByteArray(16 * 1024 * 1024, 'x')));
+    MainWindow window;
+    window.openPath(path);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    window.findChild<QLineEdit *>("destinationEdit")->setText(temp.path() + "/out");
+    window.findChild<QPushButton *>("extractButton")->click();
+    window.findChild<QPushButton *>("cancelButton")->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QVERIFY(window.findChild<QLabel *>("statusLabel")->text().contains(QStringLiteral("取消")));
+    QVERIFY(!QFile::exists(temp.path() + "/out/hello.txt"));
+    QVERIFY(window.findChild<QPushButton *>("extractButton")->isEnabled());
+  }
+  void cancelledPasswordClearsPreviousList() {
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString plain = temp.path() + "/plain.zip";
+    const QString encrypted = temp.path() + "/encrypted.7z";
+    QVERIFY(makeArchive(temp.path(), plain, "plain"));
+    QVERIFY(makeArchive(temp.path(), encrypted, "secret", QUuid::createUuid().toString()));
+    MainWindow window;
+    window.openPath(plain);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 1);
+    QTimer reject;
+    connect(&reject, &QTimer::timeout, [&] {
+      if (auto *dialog = qobject_cast<QInputDialog *>(QApplication::activeModalWidget())) dialog->reject();
+    });
+    reject.start(10);
+    window.openPath(encrypted);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 0);
+    QVERIFY(!window.findChild<QPushButton *>("extractButton")->isEnabled());
+  }
+};
+
+int main(int argc, char **argv) {
+  QApplication app(argc, argv);
+  const auto args = app.arguments();
+  if (args.size() != 3) return 2;
+  sevenZip = args[1];
+  engine = args[2];
+  DesktopTests tests;
+  return QTest::qExec(&tests, 1, argv);
+}
+#include "test_desktop.moc"

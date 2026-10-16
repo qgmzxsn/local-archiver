@@ -4,12 +4,15 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.text.InputType
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.File
+import java.io.IOException
+import java.nio.file.Files
 
 /* Thin shell. It was not compiled in the phase 1 environment.
    The password field is not saved and is not written to preferences. */
@@ -59,12 +62,41 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != 1 || resultCode != RESULT_OK) return
         val uri: Uri = data?.data ?: return
-        val dest = File(cacheDir, "opened-archive")
-        contentResolver.openInputStream(uri)?.use { input ->
-            dest.outputStream().use { input.copyTo(it) }
+        var pending: File? = null
+        try {
+            val displayName = contentResolver.query(
+                uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            } ?: uri.lastPathSegment ?: "archive"
+            // Keep compound extensions such as .tar.gz for the core's format
+            // selection. Only use the basename supplied by the document provider.
+            val name = File(displayName).name
+            if (name.isEmpty() || name == "." || name == "..") {
+                throw IOException("文件名无效")
+            }
+            val directory = Files.createTempDirectory(cacheDir.toPath(), "opened-").toFile()
+            val dest = File(directory, name)
+            pending = dest
+            val input = contentResolver.openInputStream(uri)
+                ?: throw IOException("无法读取选择的文件")
+            input.use { stream -> dest.outputStream().use { stream.copyTo(it) } }
+            val previous = archiveFile
+            archiveFile = dest
+            pending = null
+            previous?.delete()
+            previous?.parentFile?.takeIf { it.parentFile == cacheDir }?.delete()
+            output.text = "已打开 $name。"
+        } catch (error: IOException) {
+            output.text = "打开失败，请重新选择文件。"
+        } catch (error: SecurityException) {
+            output.text = "没有读取这个文件的权限。"
+        } finally {
+            pending?.let { file ->
+                file.delete()
+                file.parentFile?.delete()
+            }
         }
-        archiveFile = dest
-        output.text = "已复制到应用缓存。密码不会写入设置。"
     }
 
     private fun runNative(extract: Boolean) {
@@ -73,7 +105,9 @@ class MainActivity : Activity() {
             output.text = "先打开一个压缩包。"
             return
         }
-        val chars = password.text?.toString()?.toCharArray()
+        val chars = password.text?.let { text ->
+            if (text.isEmpty()) null else CharArray(text.length) { text[it] }
+        }
         password.text?.clear()
         try {
             val engine = applicationInfo.nativeLibraryDir + "/lib7z.so"

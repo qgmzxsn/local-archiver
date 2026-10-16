@@ -1,12 +1,16 @@
 #include "archiver.h"
+#include "utf.hpp"
 
 #include <stdio.h>
 #include <string.h>
 
 #include <iostream>
 #include <string>
+#include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -56,7 +60,37 @@ void print_result(ArchiverResult result, const ArchiverArchive *archive) {
 }
 
 bool read_password(std::string &out) {
-#if !defined(_WIN32)
+#if defined(_WIN32)
+  HANDLE input = ::GetStdHandle(STD_INPUT_HANDLE);
+  DWORD mode = 0;
+  if (::GetConsoleMode(input, &mode)) {
+    if (!::SetConsoleMode(input, mode & ~ENABLE_ECHO_INPUT)) return false;
+    std::fputs("密码（只用于这一次，不会保存）: ", stderr);
+    wchar_t buffer[256];
+    std::wstring wide;
+    bool ok = true;
+    for (;;) {
+      DWORD count = 0;
+      BOOL read = ::ReadConsoleW(input, buffer, 256, &count, nullptr);
+      if (!read || count == 0) {
+        ::SecureZeroMemory(buffer, sizeof(buffer));
+        ok = false;
+        break;
+      }
+      wide.append(buffer, count);
+      volatile wchar_t *clear = buffer;
+      for (DWORD i = 0; i < count; ++i) clear[i] = 0;
+      if (wide.find(L'\n') != std::wstring::npos) break;
+    }
+    ::SetConsoleMode(input, mode);
+    std::fputc('\n', stderr);
+    while (!wide.empty() && (wide.back() == L'\n' || wide.back() == L'\r')) wide.pop_back();
+    if (ok) out = archiver::utf16_to_utf8(wide.data(), wide.size());
+    volatile wchar_t *clear = wide.data();
+    for (size_t i = 0; i < wide.size(); ++i) clear[i] = 0;
+    return ok;
+  }
+#else
   if (isatty(STDIN_FILENO)) {
     std::fputs("密码（只用于这一次，不会保存）: ", stderr);
     termios old_term;
@@ -95,7 +129,7 @@ const char *take_engine(int &i, int argc, char **argv) {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int run_main(int argc, char **argv) {
   if (argc < 3) {
     usage();
     return ARCHIVER_ERR_ARGUMENT;
@@ -180,3 +214,18 @@ int main(int argc, char **argv) {
   wipe(password);
   return result;
 }
+
+#if defined(_WIN32)
+int wmain(int argc, wchar_t **wide_argv) {
+  std::vector<std::string> args;
+  std::vector<char *> argv;
+  for (int i = 0; i < argc; ++i) {
+    args.push_back(archiver::utf16_to_utf8(wide_argv[i], wcslen(wide_argv[i])));
+  }
+  for (auto &arg : args) argv.push_back(&arg[0]);
+  argv.push_back(nullptr);
+  return run_main(argc, argv.data());
+}
+#else
+int main(int argc, char **argv) { return run_main(argc, argv); }
+#endif

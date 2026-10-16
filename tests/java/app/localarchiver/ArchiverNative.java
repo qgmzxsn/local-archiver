@@ -1,0 +1,49 @@
+package app.localarchiver;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+
+// The same JNI class/method signatures as the Kotlin object, tested on a host JVM.
+public class ArchiverNative {
+    public native String listArchive(String archive, String engine, char[] password);
+    public native String extractArchive(String archive, String dest, String engine, char[] password);
+
+    public static void main(String[] args) throws Exception {
+        System.load(args[0]);
+        System.load(args[1]);
+        ArchiverNative api = new ArchiverNative();
+        // Construct Unicode paths in Java: some Windows Java launchers convert
+        // command-line arguments through the legacy system code page.
+        String archive = Path.of(args[3], "压缩😀.zip").toString();
+        String encrypted = Path.of(args[3], "加密🔑" + args[4]).toString();
+        String dest = Path.of(args[3], "输出😀").toString();
+        if (!Files.exists(Path.of(archive))) throw new AssertionError("missing test archive");
+        String listed = api.listArchive(archive, args[2], null);
+        if (!listed.equals("ok\n目录😀/文件🦊.txt")) {
+            throw new AssertionError("Unexpected JNI list result (code points): " +
+                listed.codePoints().mapToObj(Integer::toHexString)
+                    .collect(java.util.stream.Collectors.joining(",")));
+        }
+        String result = api.extractArchive(archive, dest, args[2], null);
+        if (!result.equals("ok")) throw new AssertionError(result);
+        Path extracted = Path.of(dest, "目录😀", "文件🦊.txt");
+        if (!Files.readString(extracted).equals("unicode")) throw new AssertionError("contents");
+        char[] password = new String(System.in.readAllBytes(), StandardCharsets.UTF_8).toCharArray();
+        try {
+            result = api.extractArchive(encrypted, dest + "-secret", args[2], password);
+            if (!result.equals("ok")) throw new AssertionError(result);
+            Path secret = Path.of(dest + "-secret", "secret.txt");
+            if (!Files.readString(secret).equals("secret")) throw new AssertionError("password");
+        } finally {
+            Arrays.fill(password, '\0');
+        }
+        result = api.extractArchive(Path.of(args[3], "damaged.zip").toString(),
+            dest + "-damaged", args[2], new char[]{'x'});
+        if (!result.startsWith("format")) {
+            throw new AssertionError("Unencrypted damage mislabeled as a password error: " + result);
+        }
+        System.out.println("JNI Unicode paths, listing, and password checks passed");
+    }
+}

@@ -1,7 +1,7 @@
 #include "safe_write.hpp"
+#include "path_safety.hpp"
 
 #include <algorithm>
-#include <cwctype>
 #include <vector>
 
 #if defined(_WIN32)
@@ -9,6 +9,7 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <winternl.h>
 #  include <cwchar>
 #else
 #  include <errno.h>
@@ -97,9 +98,15 @@ bool walk_parent(int root, const std::string &relative, bool create, Fd &parent,
 
 class PosixFile final : public SafeDest::File {
  public:
-  explicit PosixFile(int fd) : fd_(fd) {}
+  PosixFile(int fd, Fd parent, std::string leaf)
+      : fd_(fd), parent_(std::move(parent)), leaf_(std::move(leaf)) {}
   ~PosixFile() override {
+    if (!committed_) ::unlinkat(parent_.get(), leaf_.c_str(), 0);
     if (fd_ >= 0) ::close(fd_);
+  }
+  bool commit(std::string & /*error*/) override {
+    committed_ = true;
+    return true;
   }
   bool write(const void *data, size_t size, std::string &error) override {
     const char *bytes = static_cast<const char *>(data);
@@ -122,6 +129,9 @@ class PosixFile final : public SafeDest::File {
 
  private:
   int fd_;
+  Fd parent_;
+  std::string leaf_;
+  bool committed_ = false;
 };
 
 class PosixDest final : public SafeDest {
@@ -156,22 +166,11 @@ class PosixDest final : public SafeDest {
     Fd parent;
     std::string leaf;
     if (!walk_parent(fd_, relative, true, parent, leaf, error)) return false;
-    struct stat st;
-    if (::fstatat(parent.get(), leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) {
-      if (S_ISDIR(st.st_mode)) {
-        error = "io";
-        return false;
-      }
-      if (::unlinkat(parent.get(), leaf.c_str(), 0) != 0) {
-        error = "io";
-        return false;
-      }
-    }
     std::string stored;
     stored.reserve(target.size());
     for (char c : target) stored.push_back(c == '\\' ? '/' : c);
     if (::symlinkat(stored.c_str(), parent.get(), leaf.c_str()) != 0) {
-      error = "io";
+      error = errno == EEXIST ? "destination-exists" : "io";
       return false;
     }
     return true;
@@ -183,12 +182,13 @@ class PosixDest final : public SafeDest {
     std::string leaf;
     if (!walk_parent(fd_, relative, true, parent, leaf, error)) return nullptr;
     int fd = ::openat(parent.get(), leaf.c_str(),
-                      O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+                      O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0) {
-      error = (errno == ELOOP) ? "symlink-component" : "io";
+      error = errno == EEXIST ? "destination-exists" :
+              errno == ELOOP ? "symlink-component" : "io";
       return nullptr;
     }
-    return std::unique_ptr<File>(new PosixFile(fd));
+    return std::unique_ptr<File>(new PosixFile(fd, std::move(parent), leaf));
   }
 
  private:
@@ -208,24 +208,93 @@ std::wstring widen(const std::string &utf8) {
   return out;
 }
 
-bool under_root(const std::wstring &root, const std::wstring &full) {
-  if (full.size() < root.size()) return false;
-  for (size_t i = 0; i < root.size(); ++i) {
-    wchar_t a = root[i];
-    wchar_t b = full[i];
-    if (a == L'/') a = L'\\';
-    if (b == L'/') b = L'\\';
-    if (towlower(a) != towlower(b)) return false;
+class WinHandle {
+ public:
+  explicit WinHandle(HANDLE value = INVALID_HANDLE_VALUE) : value_(value) {}
+  ~WinHandle() { if (valid()) ::CloseHandle(value_); }
+  WinHandle(const WinHandle &) = delete;
+  WinHandle &operator=(const WinHandle &) = delete;
+  WinHandle(WinHandle &&other) noexcept : value_(other.value_) {
+    other.value_ = INVALID_HANDLE_VALUE;
   }
-  if (full.size() == root.size()) return true;
-  return full[root.size()] == L'\\' || root.back() == L'\\';
+  WinHandle &operator=(WinHandle &&other) noexcept {
+    if (this != &other) {
+      if (valid()) ::CloseHandle(value_);
+      value_ = other.value_;
+      other.value_ = INVALID_HANDLE_VALUE;
+    }
+    return *this;
+  }
+  HANDLE get() const { return value_; }
+  bool valid() const { return value_ && value_ != INVALID_HANDLE_VALUE; }
+ private:
+  HANDLE value_;
+};
+
+bool plain_directory(HANDLE handle, std::string &error) {
+  BY_HANDLE_FILE_INFORMATION info;
+  if (!::GetFileInformationByHandle(handle, &info)) {
+    error = "io";
+    return false;
+  }
+  if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+      !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+    error = "symlink-component";
+    return false;
+  }
+  return true;
+}
+
+WinHandle open_child(HANDLE parent, const std::string &part, bool directory,
+                     std::string &error) {
+  std::wstring name = widen(part);
+  if (name.empty() || name.size() > 32767) {
+    error = "invalid-name";
+    return WinHandle();
+  }
+  UNICODE_STRING unicode;
+  unicode.Buffer = &name[0];
+  unicode.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+  unicode.MaximumLength = unicode.Length;
+  OBJECT_ATTRIBUTES attrs = {};
+  attrs.Length = sizeof(attrs);
+  attrs.RootDirectory = parent;
+  attrs.ObjectName = &unicode;
+  attrs.Attributes = OBJ_CASE_INSENSITIVE;
+  IO_STATUS_BLOCK status_block = {};
+  HANDLE raw = INVALID_HANDLE_VALUE;
+  // Open one component relative to the verified parent, never a string path
+  // that could be redirected between checking and opening it.
+  NTSTATUS status = ::NtCreateFile(
+      &raw, directory ? FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+                      : FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+      &attrs, &status_block, nullptr, FILE_ATTRIBUTE_NORMAL,
+      directory ? FILE_SHARE_READ : 0, directory ? FILE_OPEN_IF : FILE_CREATE,
+      FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT |
+          (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE),
+      nullptr, 0);
+  if (status < 0) {
+    error = static_cast<ULONG>(status) == 0xC0000035UL ? "destination-exists" : "io";
+    return WinHandle();
+  }
+  WinHandle handle(raw);
+  if (directory && !plain_directory(handle.get(), error)) return WinHandle();
+  return handle;
 }
 
 class WinFile final : public SafeDest::File {
  public:
-  explicit WinFile(HANDLE handle) : handle_(handle) {}
+  WinFile(WinHandle handle, std::vector<WinHandle> parents)
+      : handle_(std::move(handle)), parents_(std::move(parents)) {}
   ~WinFile() override {
-    if (handle_ != INVALID_HANDLE_VALUE) ::CloseHandle(handle_);
+    if (!committed_) {
+      FILE_DISPOSITION_INFO info = {TRUE};
+      ::SetFileInformationByHandle(handle_.get(), FileDispositionInfo, &info, sizeof(info));
+    }
+  }
+  bool commit(std::string & /*error*/) override {
+    committed_ = true;
+    return true;
   }
   bool write(const void *data, size_t size, std::string &error) override {
     const char *bytes = static_cast<const char *>(data);
@@ -233,7 +302,7 @@ class WinFile final : public SafeDest::File {
     while (done < size) {
       DWORD chunk = static_cast<DWORD>(std::min(size - done, static_cast<size_t>(1 << 20)));
       DWORD wrote = 0;
-      if (!::WriteFile(handle_, bytes + done, chunk, &wrote, nullptr) || wrote == 0) {
+      if (!::WriteFile(handle_.get(), bytes + done, chunk, &wrote, nullptr) || wrote == 0) {
         error = "io";
         return false;
       }
@@ -243,22 +312,22 @@ class WinFile final : public SafeDest::File {
   }
 
  private:
-  HANDLE handle_;
+  WinHandle handle_;
+  std::vector<WinHandle> parents_;
+  bool committed_ = false;
 };
 
 class WinDest final : public SafeDest {
  public:
-  explicit WinDest(std::wstring root) : root_(std::move(root)) {}
+  explicit WinDest(WinHandle root) : root_(std::move(root)) {}
 
   bool mkdir_entry(const std::string &relative, std::string &error) override {
-    std::wstring full;
-    if (!resolve(relative, full, true, error)) return false;
-    if (!::CreateDirectoryW(full.c_str(), nullptr) &&
-        ::GetLastError() != ERROR_ALREADY_EXISTS) {
-      error = "io";
-      return false;
-    }
-    return true;
+    std::vector<WinHandle> parents;
+    std::string leaf;
+    if (!walk(relative, parents, leaf, error)) return false;
+    WinHandle dir = open_child(parents.empty() ? root_.get() : parents.back().get(),
+                               leaf, true, error);
+    return dir.valid();
   }
 
   bool make_symlink(const std::string &relative, const std::string &target,
@@ -272,56 +341,35 @@ class WinDest final : public SafeDest {
 
   std::unique_ptr<File> create_file(const std::string &relative,
                                      std::string &error) override {
-    std::wstring full;
-    if (!resolve(relative, full, true, error)) return nullptr;
-    HANDLE handle = ::CreateFileW(full.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-      error = "io";
-      return nullptr;
-    }
-    return std::unique_ptr<File>(new WinFile(handle));
+    std::vector<WinHandle> parents;
+    std::string leaf;
+    if (!walk(relative, parents, leaf, error)) return nullptr;
+    WinHandle file = open_child(parents.empty() ? root_.get() : parents.back().get(),
+                                leaf, false, error);
+    if (!file.valid()) return nullptr;
+    return std::unique_ptr<File>(new WinFile(std::move(file), std::move(parents)));
   }
 
  private:
-  bool resolve(const std::string &relative, std::wstring &full, bool create_parents,
-               std::string &error) {
-    const std::vector<std::string> parts = split_relative(relative);
-    if (parts.empty()) {
-      error = "empty-path";
+  bool walk(const std::string &relative, std::vector<WinHandle> &parents,
+            std::string &leaf, std::string &error) {
+    CheckedPath checked = check_entry_path(relative);
+    if (checked.reject != PathReject::Ok) {
+      error = "invalid-name";
       return false;
     }
-    std::wstring built = root_;
+    const std::vector<std::string> parts = split_relative(checked.relative);
     for (size_t i = 0; i + 1 < parts.size(); ++i) {
-      built.push_back(L'\\');
-      built += widen(parts[i]);
-      if (create_parents) {
-        if (!::CreateDirectoryW(built.c_str(), nullptr) &&
-            ::GetLastError() != ERROR_ALREADY_EXISTS) {
-          error = "io";
-          return false;
-        }
-      }
+      WinHandle dir = open_child(parents.empty() ? root_.get() : parents.back().get(),
+                                 parts[i], true, error);
+      if (!dir.valid()) return false;
+      parents.push_back(std::move(dir));
     }
-    built.push_back(L'\\');
-    built += widen(parts.back());
-    wchar_t resolved[MAX_PATH * 4];
-    DWORD n = ::GetFullPathNameW(built.c_str(),
-                                 static_cast<DWORD>(sizeof(resolved) / sizeof(resolved[0])),
-                                 resolved, nullptr);
-    if (n == 0 || n >= sizeof(resolved) / sizeof(resolved[0])) {
-      error = "io";
-      return false;
-    }
-    if (!under_root(root_, resolved)) {
-      error = "escapes";
-      return false;
-    }
-    full = resolved;
+    leaf = parts.back();
     return true;
   }
 
-  std::wstring root_;
+  WinHandle root_;
 };
 
 #endif
@@ -351,15 +399,16 @@ std::unique_ptr<SafeDest> SafeDest::open(const std::string &path, std::string &e
     error = "io";
     return nullptr;
   }
-  wchar_t resolved[MAX_PATH * 4];
-  DWORD n = ::GetFullPathNameW(wide.c_str(),
-                               static_cast<DWORD>(sizeof(resolved) / sizeof(resolved[0])),
-                               resolved, nullptr);
-  if (n == 0) {
+  WinHandle root(::CreateFileW(wide.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                               FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                               nullptr));
+  if (!root.valid()) {
     error = "io";
     return nullptr;
   }
-  return std::unique_ptr<SafeDest>(new WinDest(resolved));
+  if (!plain_directory(root.get(), error)) return nullptr;
+  return std::unique_ptr<SafeDest>(new WinDest(std::move(root)));
 #endif
 }
 

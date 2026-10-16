@@ -1,6 +1,5 @@
-/* Writes only inside a destination directory.
-   POSIX uses openat and O_NOFOLLOW. That path is what Linux tests run.
-   The Windows branch was not executed in the phase 1 environment. */
+/* Writes relative to an opened destination directory without following links.
+   Existing output files are never overwritten. Uncommitted new files are removed. */
 
 #ifndef LOCAL_ARCHIVER_SAFE_WRITE_HPP
 #define LOCAL_ARCHIVER_SAFE_WRITE_HPP
@@ -16,6 +15,7 @@ class SafeDest {
    public:
     virtual ~File() = default;
     virtual bool write(const void *data, size_t size, std::string &error) = 0;
+    virtual bool commit(std::string &error) = 0;
   };
 
   virtual ~SafeDest() = default;

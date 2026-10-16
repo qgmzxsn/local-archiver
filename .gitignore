@@ -17,3 +17,4 @@ apps/android/.gradle/
 apps/android/local.properties
 apps/android/**/build/
 *.user
+__pycache__/

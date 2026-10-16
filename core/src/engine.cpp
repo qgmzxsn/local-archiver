@@ -148,11 +148,18 @@ std::wstring utf8_to_wide(const char *s) {
 
 uint32_t bstr_bytes(BSTR b) {
   if (!b) return 0;
+#if defined(_WIN32)
+  return ::SysStringByteLen(b);
+#else
   return *(reinterpret_cast<uint32_t *>(b) - 1);
+#endif
 }
 
 BSTR alloc_wide(const wchar_t *s, size_t n) {
   if (n > 0x0fffffffu / sizeof(wchar_t)) return nullptr;
+#if defined(_WIN32)
+  return ::SysAllocStringLen(s, static_cast<UINT>(n));
+#else
   uint32_t bytes = static_cast<uint32_t>(n * sizeof(wchar_t));
   void *mem = malloc(bytes + sizeof(uint32_t) + sizeof(wchar_t));
   if (!mem) return nullptr;
@@ -161,11 +168,16 @@ BSTR alloc_wide(const wchar_t *s, size_t n) {
   if (n) memcpy(b, s, bytes);
   b[n] = 0;
   return b;
+#endif
 }
 
 void free_bstr(BSTR b) {
   if (!b) return;
+#if defined(_WIN32)
+  ::SysFreeString(b);
+#else
   free(reinterpret_cast<uint32_t *>(b) - 1);
+#endif
 }
 
 void prop_clear(PROPVARIANT *v) {
@@ -537,6 +549,20 @@ struct ExtractCtx {
   std::string pending_path;
   std::string *link_buf = nullptr;
   uint64_t written = 0;
+  uint64_t total = 0;
+  ArchiverProgressCallback progress = nullptr;
+  void *progress_user = nullptr;
+  bool cancelled = false;
+
+  bool report_progress() {
+    if (cancelled) return false;
+    if (progress && progress(written, total, progress_user)) {
+      cancelled = true;
+      if (message) *message = "extraction cancelled";
+      return false;
+    }
+    return true;
+  }
 };
 
 class FileOutStream Z7_final : public ISequentialOutStream, public CMyUnknownImp {
@@ -550,6 +576,7 @@ class FileOutStream Z7_final : public ISequentialOutStream, public CMyUnknownImp
 Z7_COM7F_IMF(FileOutStream::Write(const void *data, UInt32 size, UInt32 *processedSize)) {
   if (processedSize) *processedSize = 0;
   if (!file || !ctx) return E_FAIL;
+  if (!ctx->report_progress()) return E_ABORT;
   if (size > kWriteCap || ctx->written > kWriteCap - size) {
     ctx->io_failed = true;
     if (ctx->message) *ctx->message = "output is larger than this build will write";
@@ -563,6 +590,7 @@ Z7_COM7F_IMF(FileOutStream::Write(const void *data, UInt32 size, UInt32 *process
   }
   ctx->written += size;
   if (processedSize) *processedSize = size;
+  if (!ctx->report_progress()) return E_ABORT;
   return S_OK;
 }
 
@@ -589,9 +617,13 @@ Z7_COM7F_IMF(MemOutStream::Write(const void *data, UInt32 size, UInt32 *processe
 }
 
 void note_write_error(ExtractCtx *ctx, const std::string &error) {
-  if (error == "io") {
+  if (error == "io" || error == "destination-exists") {
     ctx->io_failed = true;
-    if (ctx->message && ctx->message->empty()) *ctx->message = "could not write output";
+    if (ctx->message && ctx->message->empty()) {
+      *ctx->message = error == "destination-exists"
+                          ? "destination file already exists; nothing was overwritten"
+                          : "could not write output";
+    }
     return;
   }
   if (error == "windows-symlink-untested") {
@@ -616,6 +648,8 @@ class ExtractCallback Z7_final : public IArchiveExtractCallback,
   IInArchive *archive = nullptr;
   ExtractCtx *ctx = nullptr;
   std::string link_buf;
+  CMyComPtr<ISequentialOutStream> active_output;
+  archiver::SafeDest::File *active_file = nullptr;
 };
 
 bool prop_bool(const PROPVARIANT &prop) {
@@ -655,13 +689,21 @@ HRESULT read_string_prop(IInArchive *archive, UInt32 index, PROPID id, std::stri
   return S_OK;
 }
 
-Z7_COM7F_IMF(ExtractCallback::SetTotal(UInt64 /*total*/)) { return S_OK; }
-Z7_COM7F_IMF(ExtractCallback::SetCompleted(const UInt64 * /*completeValue*/)) { return S_OK; }
+Z7_COM7F_IMF(ExtractCallback::SetTotal(UInt64 total)) {
+  if (!ctx) return E_FAIL;
+  ctx->total = total;
+  return ctx->report_progress() ? S_OK : E_ABORT;
+}
+Z7_COM7F_IMF(ExtractCallback::SetCompleted(const UInt64 * /*completeValue*/)) {
+  return ctx && ctx->report_progress() ? S_OK : E_ABORT;
+}
 
 Z7_COM7F_IMF(ExtractCallback::GetStream(UInt32 index, ISequentialOutStream **outStream,
                                         Int32 askExtractMode)) {
   *outStream = nullptr;
   if (!ctx || !archive) return E_FAIL;
+  active_output.Release();
+  active_file = nullptr;
   ctx->pending_link = false;
   link_buf.clear();
   if (askExtractMode != NArchive::NExtract::NAskMode::kExtract) return S_OK;
@@ -750,6 +792,8 @@ Z7_COM7F_IMF(ExtractCallback::GetStream(UInt32 index, ISequentialOutStream **out
   FileOutStream *out = new FileOutStream();
   out->file = std::move(file);
   out->ctx = ctx;
+  active_output = out;
+  active_file = out->file.get();
   CMyComPtr<ISequentialOutStream> held(out);
   *outStream = held.Detach();
   return S_OK;
@@ -759,14 +803,25 @@ Z7_COM7F_IMF(ExtractCallback::PrepareOperation(Int32 /*askExtractMode*/)) { retu
 
 Z7_COM7F_IMF(ExtractCallback::SetOperationResult(Int32 opRes)) {
   if (!ctx) return S_OK;
+  if (active_output) {
+    if (opRes == NArchive::NExtract::NOperationResult::kOK && !ctx->cancelled) {
+      std::string error;
+      if (!active_file->commit(error)) note_write_error(ctx, error);
+    }
+    active_output.Release();
+    active_file = nullptr;
+  }
   if (opRes == NArchive::NExtract::NOperationResult::kWrongPassword) ctx->wrong_password = true;
-  if (opRes == NArchive::NExtract::NOperationResult::kDataError ||
-      opRes == NArchive::NExtract::NOperationResult::kCRCError ||
-      opRes == NArchive::NExtract::NOperationResult::kUnsupportedMethod) {
+  if (opRes != NArchive::NExtract::NOperationResult::kOK &&
+      opRes != NArchive::NExtract::NOperationResult::kWrongPassword) {
     ctx->data_error = true;
   }
   if (ctx->pending_link) {
     ctx->pending_link = false;
+    if (opRes != NArchive::NExtract::NOperationResult::kOK || ctx->cancelled) {
+      wipe_string(link_buf);
+      return S_OK;
+    }
     if (link_buf.find('\0') != std::string::npos || link_buf.size() > kMaxSymlink) {
       ctx->path_failed = true;
       if (ctx->message) *ctx->message = "refused symlink";
@@ -782,7 +837,6 @@ Z7_COM7F_IMF(ExtractCallback::SetOperationResult(Int32 opRes)) {
     if (ctx->dest && !ctx->dest->make_symlink(ctx->pending_path, link_buf, error)) {
       note_write_error(ctx, error);
     }
-    link_buf.clear();
     wipe_string(link_buf);
   }
   return S_OK;
@@ -870,8 +924,9 @@ ArchiverResult from_extract(HRESULT hr, const ExtractCtx &ctx, const PasswordSta
   if (ctx.path_failed) return ARCHIVER_ERR_PATH;
   if (ctx.unsupported) return ARCHIVER_ERR_UNSUPPORTED;
   if (ctx.io_failed) return ARCHIVER_ERR_IO;
+  if (ctx.cancelled) return ARCHIVER_ERR_CANCELLED;
   if (password.asked && !password.provided) return ARCHIVER_ERR_PASSWORD_REQUIRED;
-  if (ctx.wrong_password || (ctx.data_error && (encrypted || password.asked || password.provided))) {
+  if (ctx.wrong_password || (ctx.data_error && (encrypted || password.asked))) {
     return password.provided ? ARCHIVER_ERR_PASSWORD : ARCHIVER_ERR_PASSWORD_REQUIRED;
   }
   if (encrypted && !password.provided && hr != S_OK) return ARCHIVER_ERR_PASSWORD_REQUIRED;
@@ -1152,13 +1207,17 @@ ArchiverResult extract_single(IInArchive *archive, archiver::SafeDest &dest, Pas
   UInt32 all = static_cast<UInt32>(-1);
   HRESULT hr = archive->Extract(nullptr, all, 0, held);
   if (password.asked && !password.provided) return ARCHIVER_ERR_PASSWORD_REQUIRED;
-  if (callback->wrong_password || (callback->failed && password.provided)) {
+  if (callback->wrong_password || (callback->failed && password.asked && password.provided)) {
     message = "password rejected";
     return ARCHIVER_ERR_PASSWORD;
   }
   if (hr != S_OK || callback->failed || callback->seen != 1) {
     message = "could not unwrap tar compression";
     return ARCHIVER_ERR_FORMAT;
+  }
+  if (!callback->file->commit(error)) {
+    message = "could not write temporary tar";
+    return ARCHIVER_ERR_IO;
   }
   return ARCHIVER_OK;
 }
@@ -1196,6 +1255,7 @@ const char *archiver_result_string(ArchiverResult result) {
     case ARCHIVER_ERR_PASSWORD: return "password-rejected";
     case ARCHIVER_ERR_PATH: return "path";
     case ARCHIVER_ERR_UNSUPPORTED: return "unsupported";
+    case ARCHIVER_ERR_CANCELLED: return "cancelled";
   }
   return "error";
 }
@@ -1312,6 +1372,12 @@ void archiver_entry_free(ArchiverEntry *entry) {
 }
 
 ArchiverResult archiver_extract(ArchiverArchive *archive, const char *dest_dir, const char *password) {
+  return archiver_extract_with_progress(archive, dest_dir, password, nullptr, nullptr);
+}
+
+ArchiverResult archiver_extract_with_progress(
+    ArchiverArchive *archive, const char *dest_dir, const char *password,
+    ArchiverProgressCallback progress, void *user) {
   if (!archive || !dest_dir || !dest_dir[0]) return ARCHIVER_ERR_ARGUMENT;
   if (!archive->archive) {
     if (archive->message.empty()) archive->message = "archive is not open";
@@ -1327,13 +1393,18 @@ ArchiverResult archiver_extract(ArchiverArchive *archive, const char *dest_dir, 
   std::string error;
   std::unique_ptr<archiver::SafeDest> dest = archiver::SafeDest::open(dest_dir, error);
   if (!dest) {
-    archive->message = "could not open destination";
-    return ARCHIVER_ERR_IO;
+    archive->message = error == "symlink-component" ? "refused destination link"
+                                                    : "could not open destination";
+    return error == "symlink-component" ? ARCHIVER_ERR_PATH : ARCHIVER_ERR_IO;
   }
   ExtractCtx ctx;
   ctx.password = &pw;
   ctx.dest = dest.get();
   ctx.message = &archive->message;
+  ctx.progress = progress;
+  ctx.progress_user = user;
+  for (const ListedEntry &entry : archive->entries) ctx.total += entry.size;
+  if (!ctx.report_progress()) return ARCHIVER_ERR_CANCELLED;
   ExtractCallback *callback = new ExtractCallback();
   callback->archive = archive->archive;
   callback->ctx = &ctx;

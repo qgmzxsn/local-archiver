@@ -14,7 +14,8 @@ enum class PathReject {
   DotDot,
   Control,
   Escapes,
-  TooLong
+  TooLong,
+  WindowsName
 };
 
 struct CheckedPath {

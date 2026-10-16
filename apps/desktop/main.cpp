@@ -1,11 +1,26 @@
 #include "MainWindow.hpp"
 
 #include <QApplication>
+#include <QDir>
+#include <QIcon>
+#include <QTimer>
+#include <QTranslator>
+#include "archiver.h"
 
 int main(int argc, char **argv) {
   QApplication app(argc, argv);
   QApplication::setApplicationName(QStringLiteral("local-archiver"));
+  QApplication::setApplicationVersion(QStringLiteral(ARCHIVER_VERSION));
+  QApplication::setWindowIcon(QIcon(QStringLiteral(":/local-archiver.ico")));
+  QTranslator translator;
+  const QString translationDir = QDir(QApplication::applicationDirPath()).filePath("translations");
+  if (translator.load(QStringLiteral("qt_zh_CN"), translationDir) ||
+      translator.load(QStringLiteral("qtbase_zh_CN"), translationDir))
+    app.installTranslator(&translator);
   MainWindow window;
   window.show();
+  const QStringList arguments = app.arguments();
+  if (arguments.size() > 1)
+    QTimer::singleShot(0, &window, [&window, arguments] { window.openPath(arguments[1]); });
   return app.exec();
 }
