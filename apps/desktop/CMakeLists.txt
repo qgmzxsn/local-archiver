@@ -4,6 +4,8 @@ qt_standard_project_setup()
 add_library(archiver_desktop STATIC
   MainWindow.cpp
   MainWindow.hpp
+  extract_path.cpp
+  extract_path.hpp
   password_book.cpp
   password_book.hpp
 )

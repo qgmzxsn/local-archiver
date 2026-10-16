@@ -1,7 +1,9 @@
 #include "MainWindow.hpp"
+#include "extract_path.hpp"
 #include <QApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -147,6 +149,54 @@ class DesktopTests : public QObject {
     QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
     QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 0);
     QVERIFY(!window.findChild<QPushButton *>("extractButton")->isEnabled());
+  }
+  void disguisedMp4WithLongTitleExtractsToLegalFolder() {
+    const QString leaf = QStringLiteral("【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！ 【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！_1.mp4");
+    QCOMPARE(sanitizeFolderComponent(leaf), QStringLiteral("【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！ 【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！_1"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("bad:name*.mp4")), QStringLiteral("bad_name_"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("keep. .mp4")), QStringLiteral("keep"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("CON.mp4")), QStringLiteral("解压文件"));
+
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString zip = temp.path() + "/plain.zip";
+    QVERIFY(makeArchive(temp.path(), zip, "from-mp4-name"));
+    const QString mp4 = temp.path() + "/" + leaf;
+    QVERIFY(QFile::rename(zip, mp4));
+    QCOMPARE(existingDirectoryForDialog(mp4), QFileInfo(mp4).absolutePath());
+    QVERIFY(QFileInfo(existingDirectoryForDialog(mp4)).isDir());
+    const QString suggested = suggestedExtractDirectory(mp4);
+    const QString folderName = QFileInfo(suggested).fileName();
+    QVERIFY(folderName.contains(QStringLiteral("元梦之星")));
+    QVERIFY(!folderName.endsWith(QStringLiteral(".mp4"), Qt::CaseInsensitive));
+    QVERIFY(!folderName.endsWith(QLatin1Char(' ')));
+    QVERIFY(!folderName.endsWith(QLatin1Char('.')));
+    for (const QChar ch : QStringLiteral("\\/:*?\"<>|")) QVERIFY(!folderName.contains(ch));
+    QVERIFY(suggested.size() <= 240);
+    QVERIFY(QFileInfo(suggested).absoluteFilePath().compare(QFileInfo(mp4).absoluteFilePath(),
+                                                            Qt::CaseInsensitive) != 0);
+
+    MainWindow window;
+    window.openPath(mp4);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 1);
+    QString used;
+    QTimer acceptExtract;
+    connect(&acceptExtract, &QTimer::timeout, [&] {
+      if (auto *dialog = QApplication::activeModalWidget()) {
+        if (auto *edit = dialog->findChild<QLineEdit *>("destinationEdit")) used = edit->text();
+        if (auto *ok = dialog->findChild<QPushButton *>("extractOk")) ok->click();
+      }
+    });
+    acceptExtract.start(10);
+    window.findChild<QPushButton *>("extractButton")->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QVERIFY(window.findChild<QLabel *>("statusLabel")->text().contains(QStringLiteral("解压完成")));
+    const QString dest = QDir::fromNativeSeparators(used);
+    QCOMPARE(QFileInfo(dest).fileName(), folderName);
+    QFile output(dest + "/hello.txt");
+    QVERIFY(output.open(QIODevice::ReadOnly));
+    QCOMPARE(output.readAll(), QByteArray("from-mp4-name"));
   }
 };
 

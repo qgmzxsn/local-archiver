@@ -1,4 +1,5 @@
 #include "MainWindow.hpp"
+#include "extract_path.hpp"
 #include "password_book.hpp"
 #include "archiver.h"
 
@@ -132,14 +133,6 @@ int reportProgress(uint64_t completed, uint64_t total, void *user) {
   state->completed.store(completed, std::memory_order_relaxed);
   state->total.store(total, std::memory_order_relaxed);
   return state->cancel.load(std::memory_order_relaxed) ? 1 : 0;
-}
-
-QString suggestedDestination(const QString &path) {
-  const QFileInfo info(path);
-  QString name = info.completeBaseName();
-  if (name.endsWith(QStringLiteral(".tar"), Qt::CaseInsensitive)) name.chop(4);
-  if (name.isEmpty()) name = QStringLiteral("解压文件");
-  return info.dir().filePath(name);
 }
 
 bool looksLikeArchive(const QString &name) {
@@ -325,7 +318,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("解压"));
     auto *box = new QVBoxLayout(&dialog);
-    auto *edit = new QLineEdit(QDir::toNativeSeparators(suggestedDestination(archivePath_)), &dialog);
+    auto *edit = new QLineEdit(QDir::toNativeSeparators(suggestedExtractDirectory(archivePath_)), &dialog);
     edit->setObjectName(QStringLiteral("destinationEdit"));
     auto *browse = new QPushButton(QStringLiteral("浏览…"), &dialog);
     auto *row = new QHBoxLayout();
@@ -342,13 +335,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     ok->setText(QStringLiteral("确定"));
     box->addWidget(buttons);
     connect(browse, &QPushButton::clicked, &dialog, [this, edit] {
-      const QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("解压到"), edit->text());
+      const QString start = existingDirectoryForDialog(edit->text());
+      const QString path =
+          QFileDialog::getExistingDirectory(this, QStringLiteral("选择输出文件夹"), start);
       if (!path.isEmpty()) edit->setText(QDir::toNativeSeparators(path));
     });
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     if (dialog.exec() != QDialog::Accepted) return;
-    startExtract(QDir::fromNativeSeparators(edit->text().trimmed()), nested->isChecked());
+    startExtract(normalizeExtractDirectory(edit->text(), archivePath_), nested->isChecked());
   });
   connect(testButton_, &QPushButton::clicked, this, &MainWindow::testArchive);
   connect(infoButton_, &QPushButton::clicked, this, &MainWindow::showInfo);
