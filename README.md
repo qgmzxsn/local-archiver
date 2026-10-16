@@ -60,12 +60,21 @@ Android arm64 动态库（NDK r27c，不进仓库）：
 
 产物在 `build-android/arm64-v8a/`：`libarchiver.so`、`libarchiver_jni.so`、`lib7z.so`。`libarchiver.so` 运行时再打开 `7z.so`，没有把 7-Zip 编进去。
 
+调试 APK 使用上面这些已经编好的 arm64 库，不再重编内核。需要本机 Android SDK（命令行工具即可）：
+
+```sh
+cd apps/android
+gradle assembleDebug
+```
+
+产物：`apps/android/app/build/outputs/apk/debug/app-debug.apk`。
+
 在 Linux 上实际解压通过的有：ZIP、7z、tar、tar.gz、tar.bz2、tar.xz、tar.zst，以及 RAR5（包括需要密码的 RAR5）。旧格式 RAR4 的处理代码在 7-Zip 动态库里，这个环境没有写出 RAR4 文件的工具，所以没有单独测过 RAR4。
 
 ## 还没有编出来的
 
 - macOS：必须在 Mac 上编。`./scripts/build-macos.sh` 在 Linux 上直接退出，这里没有、也不会放一个假的 macOS 二进制。界面源码仍是 `apps/desktop`。
-- Android APK：没有。NDK 能编 `.so`，但这里没有 Android SDK，仓库里也没有 Gradle Wrapper。SDK 要另外下载平台包并接受许可，不算一次干净的安装，所以停在 `.so`，没有做 APK。
+- Android 安装包不会放进 git。调试 APK 由 `apps/android` 里的 Gradle 打出来，库来自 `build-android/arm64-v8a`。
 
 不要把没编过的应用当成已经完成。
 
@@ -85,4 +94,4 @@ Android arm64 动态库（NDK r27c，不进仓库）：
 
 Phase 1 is three separate local apps (Windows, macOS, Android) that open and extract ZIP, 7z, tar, and tar compressed with gz, bz2, xz, or zstd. RAR and RAR5 can be extracted only. A password is typed when needed and is not stored. There is no network, no password book, no split volumes, no renamed-extension or appended-archive detection, and no nested extract.
 
-The C++ core loads 7-Zip 26.04 as a shared library. Original code is MIT. 7-Zip is LGPL (and not MIT); RAR decoding is under the UnRAR license (and not MIT). See `LICENSES/`. On this Linux machine: the Linux core and Qt shell (`./scripts/build-linux.sh`), a Windows CLI (`./scripts/build-windows.sh`, Wine-tested), a Windows Qt exe (`./scripts/build-windows-qt.sh`, linked, process stayed up under Wine), and Android arm64 `.so` files (`./scripts/build-android.sh`). macOS was not built; a Mac is required. No Android APK was built.
+The C++ core loads 7-Zip 26.04 as a shared library. Original code is MIT. 7-Zip is LGPL (and not MIT); RAR decoding is under the UnRAR license (and not MIT). See `LICENSES/`. On this Linux machine: the Linux core and Qt shell (`./scripts/build-linux.sh`), a Windows CLI (`./scripts/build-windows.sh`, Wine-tested), a Windows Qt exe (`./scripts/build-windows-qt.sh`, linked, process stayed up under Wine), and Android arm64 `.so` files (`./scripts/build-android.sh`). A debug APK is `apps/android` `gradle assembleDebug`, packaging those libraries. macOS was not built; a Mac is required.
