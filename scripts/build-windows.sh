@@ -1,14 +1,38 @@
 #!/bin/sh
-# Honest stub. The phase 1 environment is Linux and did not build a Windows app.
+# Cross-build the Windows CLI and 7z.dll on Linux with MinGW.
+# The Qt shell is not part of this build: this machine has no Windows Qt kit.
 set -eu
-os=$(uname -s 2>/dev/null || echo unknown)
-case "$os" in
-  MINGW*|MSYS*|CYGWIN*)
-    echo "A Windows shell was detected, but this script was not run or verified there." >&2
-    echo "Install Qt 6, build 7z.dll from third_party/7zip/src/CPP/7zip/Bundles/Format7zF, then run cmake. See README.md." >&2
-    exit 1
-    ;;
-esac
-echo "This system is ${os}. No Windows executable was built." >&2
-echo "Windows and macOS share the Qt sources in apps/desktop. Build that project on Windows." >&2
-exit 1
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+
+if ! command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
+  echo "blocker: x86_64-w64-mingw32-g++ is not installed." >&2
+  echo "On Debian/Ubuntu: sudo apt-get install g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64" >&2
+  exit 1
+fi
+if ! command -v x86_64-w64-mingw32-windres >/dev/null 2>&1; then
+  echo "blocker: x86_64-w64-mingw32-windres is not installed." >&2
+  exit 1
+fi
+
+"$root/scripts/fetch-7zip.sh"
+src="$root/third_party/7zip/src"
+bundle="$src/CPP/7zip/Bundles/Format7zF"
+make -C "$bundle" -j"$(nproc)" -f ../../cmpl_gcc.mak \
+  CROSS_COMPILE=x86_64-w64-mingw32- \
+  IS_MINGW=1 \
+  RC=x86_64-w64-mingw32-windres \
+  O=b/mingw64 \
+  LFLAGS_STRIP=
+dll="$bundle/b/mingw64/7z.dll"
+test -f "$dll"
+
+cmake -S "$root" -B "$root/build-windows" \
+  -DCMAKE_TOOLCHAIN_FILE="$root/cmake/mingw-w64-x86_64.cmake" \
+  -DSEVENZIP_SRC="$src" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$root/build-windows" -j"$(nproc)"
+cp -f "$dll" "$root/build-windows/7z.dll"
+
+echo "Windows CLI: $root/build-windows/archiver-cli.exe"
+echo "Windows 7-Zip library: $root/build-windows/7z.dll"
+echo "The Qt shell was not linked. There is no Windows Qt kit on this machine."

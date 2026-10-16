@@ -1,4 +1,7 @@
 build/
+build-windows/
+build-windows-qt/
+build-android/
 third_party/7zip/src/
 third_party/7zip/*.tar.xz
 third_party/7zip/*.7z

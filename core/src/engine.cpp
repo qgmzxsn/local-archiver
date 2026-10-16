@@ -11,9 +11,16 @@
 
 #include <stdlib.h>
 
-#define INITGUID
-#include "Common/MyGuidDef.h"
-#include "Common/MyWindows.h"
+#if defined(_WIN32)
+/* Windows headers already define GUID. Do not include 7-Zip's MyGuidDef.h first. */
+#  include "Common/MyWindows.h"
+#  define INITGUID
+#  include <initguid.h>
+#else
+#  define INITGUID
+#  include "Common/MyGuidDef.h"
+#  include "Common/MyWindows.h"
+#endif
 #include "Common/Common0.h"
 #include "7zip/IStream.h"
 #include "7zip/IProgress.h"
@@ -294,8 +301,15 @@ struct ArchiverArchive {
     engine.close();
     if (!temp_dir.empty()) {
       std::string inner = temp_dir + "/inner.bin";
+#if defined(_WIN32)
+      std::wstring wide_inner = utf8_to_wide(inner.c_str());
+      std::wstring wide_dir = utf8_to_wide(temp_dir.c_str());
+      ::DeleteFileW(wide_inner.c_str());
+      ::RemoveDirectoryW(wide_dir.c_str());
+#else
       ::unlink(inner.c_str());
       ::rmdir(temp_dir.c_str());
+#endif
       temp_dir.clear();
     }
   }
@@ -424,35 +438,67 @@ class FileInStream Z7_final : public IInStream,
                               public CMyUnknownImp {
   Z7_IFACES_IMP_UNK_3(IInStream, ISequentialInStream, IStreamGetSize)
  public:
+#if defined(_WIN32)
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  ~FileInStream() {
+    if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
+  }
+#else
   int fd = -1;
   ~FileInStream() {
     if (fd >= 0) ::close(fd);
   }
+#endif
 };
 
 Z7_COM7F_IMF(FileInStream::Read(void *data, UInt32 size, UInt32 *processedSize)) {
   if (processedSize) *processedSize = 0;
+#if defined(_WIN32)
+  DWORD got = 0;
+  if (!::ReadFile(handle, data, size, &got, nullptr)) return E_FAIL;
+  if (processedSize) *processedSize = static_cast<UInt32>(got);
+#else
   ssize_t n = ::read(fd, data, size);
   if (n < 0) return E_FAIL;
   if (processedSize) *processedSize = static_cast<UInt32>(n);
+#endif
   return S_OK;
 }
 
 Z7_COM7F_IMF(FileInStream::Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition)) {
+#if defined(_WIN32)
+  DWORD method = FILE_BEGIN;
+  if (seekOrigin == 1) method = FILE_CURRENT;
+  else if (seekOrigin == 2) method = FILE_END;
+  else if (seekOrigin != 0) return E_INVALIDARG;
+  LARGE_INTEGER move;
+  move.QuadPart = offset;
+  LARGE_INTEGER next;
+  next.QuadPart = 0;
+  if (!::SetFilePointerEx(handle, move, &next, method)) return HRESULT_WIN32_ERROR_NEGATIVE_SEEK;
+  if (newPosition) *newPosition = static_cast<UInt64>(next.QuadPart);
+#else
   int whence = SEEK_SET;
   if (seekOrigin == 1) whence = SEEK_CUR;
   else if (seekOrigin == 2) whence = SEEK_END;
   else if (seekOrigin != 0) return E_INVALIDARG;
   off_t pos = ::lseek(fd, static_cast<off_t>(offset), whence);
-  if (pos < 0) return MY_E_ERROR_NEGATIVE_SEEK;
+  if (pos < 0) return HRESULT_WIN32_ERROR_NEGATIVE_SEEK;
   if (newPosition) *newPosition = static_cast<UInt64>(pos);
+#endif
   return S_OK;
 }
 
 Z7_COM7F_IMF(FileInStream::GetSize(UInt64 *size)) {
+#if defined(_WIN32)
+  LARGE_INTEGER length;
+  if (!::GetFileSizeEx(handle, &length)) return E_FAIL;
+  *size = static_cast<UInt64>(length.QuadPart);
+#else
   struct stat st;
   if (::fstat(fd, &st) != 0) return E_FAIL;
   *size = static_cast<UInt64>(st.st_size);
+#endif
   return S_OK;
 }
 
@@ -753,11 +799,48 @@ Z7_COM7F_IMF(ExtractCallback::CryptoGetTextPassword(BSTR *passwordOut)) {
 }
 
 FileInStream *open_fd(const std::string &path) {
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return nullptr;
   FileInStream *stream = new FileInStream();
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path.c_str());
+  HANDLE handle = ::CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    delete stream;
+    return nullptr;
+  }
+  stream->handle = handle;
+#else
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    delete stream;
+    return nullptr;
+  }
   stream->fd = fd;
+#endif
   return stream;
+}
+
+bool read_prefix(const std::string &path, unsigned char *buf, size_t size, size_t *got) {
+  *got = 0;
+#if defined(_WIN32)
+  std::wstring wide = utf8_to_wide(path.c_str());
+  HANDLE handle = ::CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return false;
+  DWORD n = 0;
+  BOOL ok = ::ReadFile(handle, buf, static_cast<DWORD>(size), &n, nullptr);
+  ::CloseHandle(handle);
+  if (!ok) return false;
+  *got = n;
+#else
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  ssize_t n = ::read(fd, buf, size);
+  ::close(fd);
+  if (n < 0) return false;
+  *got = static_cast<size_t>(n);
+#endif
+  return true;
 }
 
 ArchiverResult from_open_hr(HRESULT hr, const PasswordState &password) {
@@ -797,6 +880,21 @@ ArchiverResult from_extract(HRESULT hr, const ExtractCtx &ctx, const PasswordSta
 }
 
 bool make_temp_dir(std::string &out) {
+#if defined(_WIN32)
+  wchar_t base[MAX_PATH];
+  DWORD n = ::GetTempPathW(MAX_PATH, base);
+  if (n == 0 || n >= MAX_PATH) return false;
+  for (unsigned i = 0; i < 1000; ++i) {
+    std::wstring dir = std::wstring(base) + L"local-archiver-" +
+                       std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(i);
+    if (::CreateDirectoryW(dir.c_str(), nullptr)) {
+      out = wide_to_utf8(dir.c_str(), dir.size());
+      return true;
+    }
+    if (::GetLastError() != ERROR_ALREADY_EXISTS) return false;
+  }
+  return false;
+#else
   const char *base = getenv("TMPDIR");
   std::string dir = (base && base[0]) ? base : "/tmp";
   if (dir.back() != '/') dir.push_back('/');
@@ -806,6 +904,7 @@ bool make_temp_dir(std::string &out) {
   if (!mkdtemp(buf.data())) return false;
   out = buf.data();
   return true;
+#endif
 }
 
 ArchiverResult open_with(EngineLib &lib, const GUID &clsid, const std::string &path,
@@ -932,13 +1031,11 @@ bool handler_for(EngineLib &lib, Kind kind, const std::string &path, GUID &out, 
   if (kind == Kind::Rar) {
     unsigned char sig[8];
     memset(sig, 0, sizeof(sig));
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    size_t n = 0;
+    if (!read_prefix(path, sig, sizeof(sig), &n)) {
       message = "could not open archive file";
       return false;
     }
-    ssize_t n = ::read(fd, sig, sizeof(sig));
-    ::close(fd);
     bool rar5 = n >= 8 && sig[0] == 'R' && sig[1] == 'a' && sig[2] == 'r' && sig[3] == '!' &&
                 sig[6] == 1;
     if (find_handler(lib, rar5 ? "Rar5" : "Rar", out)) return true;

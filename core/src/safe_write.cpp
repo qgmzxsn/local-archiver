@@ -1,6 +1,7 @@
 #include "safe_write.hpp"
 
 #include <algorithm>
+#include <cwctype>
 #include <vector>
 
 #if defined(_WIN32)
@@ -232,7 +233,7 @@ class WinFile final : public SafeDest::File {
     while (done < size) {
       DWORD chunk = static_cast<DWORD>(std::min(size - done, static_cast<size_t>(1 << 20)));
       DWORD wrote = 0;
-      if (!::WriteFile(handle_, bytes + done, chunk, &wrote, nullptr)) {
+      if (!::WriteFile(handle_, bytes + done, chunk, &wrote, nullptr) || wrote == 0) {
         error = "io";
         return false;
       }

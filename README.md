@@ -32,32 +32,40 @@ RAR 不能创建。不要用这份代码去重做 RAR 压缩算法。
 
 ## 在这台 Linux 上已经编过的
 
-下面这条命令会下载 7-Zip 26.04 源码、编出 `7z.so`、编出内核和命令行，并跑测试：
+Linux 内核、命令行和 Qt 界面：
 
 ```sh
 ./scripts/build-linux.sh
-```
-
-然后可以这样用（把路径换成你的文件）：
-
-```sh
 ./build/archiver-cli list 你的文件.zip --engine ./build/7z.so
 ./build/archiver-cli extract 你的文件.zip 目标文件夹 --engine ./build/7z.so
 ```
 
-需要密码时，程序会问你。不要把密码写在命令后面。
+需要密码时程序会问你。不要把密码写在命令后面。装了 Linux 版 Qt 6 时，同一条命令还会编出 `./build/local-archiver`。那是这份界面在 Linux 上的结果，不是 Windows 或 macOS 安装包。
 
-如果装了 Qt 6，同一条 CMake 也会编出 `./build/local-archiver`。这是 Windows/macOS 那份界面在 Linux 上编出来的结果，用来确认界面代码能编过。它不是 Windows 或 macOS 的安装包。
+Windows 命令行（MinGW 交叉编译）。产物是 `build-windows/archiver-cli.exe`、`libarchiver.dll` 和 `7z.dll`：
+
+```sh
+./scripts/build-windows.sh
+```
+
+在这台机器上用 Wine 跑过：能列出并解压 ZIP，含 `..` 的路径会被拒绝。
+
+Windows Qt 界面也能链上，命令是 `./scripts/build-windows-qt.sh`。它需要仓库外面的两套 Qt 6.8（Windows MinGW 套件，以及给 moc 用的 Linux Qt 6.8）。链出来的是 `build-windows-qt/local-archiver.exe`。Wine 里进程能停住，没有做完整的鼠标点击。系统自带的 Linux Qt 6.4 不能链进 Windows 程序。
+
+Android arm64 动态库（NDK r27c，不进仓库）：
+
+```sh
+./scripts/build-android.sh
+```
+
+产物在 `build-android/arm64-v8a/`：`libarchiver.so`、`libarchiver_jni.so`、`lib7z.so`。`libarchiver.so` 运行时再打开 `7z.so`，没有把 7-Zip 编进去。
 
 在 Linux 上实际解压通过的有：ZIP、7z、tar、tar.gz、tar.bz2、tar.xz、tar.zst，以及 RAR5（包括需要密码的 RAR5）。旧格式 RAR4 的处理代码在 7-Zip 动态库里，这个环境没有写出 RAR4 文件的工具，所以没有单独测过 RAR4。
 
 ## 还没有编出来的
 
-这个仓库是在 Linux 上做的。
-
-- Windows：没有编出 exe。源码在 `apps/desktop`。`./scripts/build-windows.sh` 会说明这一点并退出。到 Windows 上需要 Qt 6，并用 7-Zip 官方 makefile 编出 `7z.dll`，再跑 CMake。
-- macOS：没有编出 app。界面源码和 Windows 是同一份。`./scripts/build-macos.sh` 会说明这一点并退出。
-- Android：没有编出 APK，也没有编出 Android 用的 `.so`。Kotlin 和 JNI 源码在 `apps/android`。这里没有 Android SDK / NDK。`./scripts/build-android.sh` 会说明这一点并退出。
+- macOS：必须在 Mac 上编。`./scripts/build-macos.sh` 在 Linux 上直接退出，这里没有、也不会放一个假的 macOS 二进制。界面源码仍是 `apps/desktop`。
+- Android APK：没有。NDK 能编 `.so`，但这里没有 Android SDK，仓库里也没有 Gradle Wrapper。SDK 要另外下载平台包并接受许可，不算一次干净的安装，所以停在 `.so`，没有做 APK。
 
 不要把没编过的应用当成已经完成。
 
@@ -77,4 +85,4 @@ RAR 不能创建。不要用这份代码去重做 RAR 压缩算法。
 
 Phase 1 is three separate local apps (Windows, macOS, Android) that open and extract ZIP, 7z, tar, and tar compressed with gz, bz2, xz, or zstd. RAR and RAR5 can be extracted only. A password is typed when needed and is not stored. There is no network, no password book, no split volumes, no renamed-extension or appended-archive detection, and no nested extract.
 
-The C++ core loads 7-Zip 26.04 as a shared library. Original code is MIT. 7-Zip is LGPL (and not MIT); RAR decoding is under the UnRAR license (and not MIT). See `LICENSES/`. On this Linux machine the core, the command-line checker, and (if Qt 6 is installed) the shared desktop shell were built. Windows, macOS, and Android packages were not built here.
+The C++ core loads 7-Zip 26.04 as a shared library. Original code is MIT. 7-Zip is LGPL (and not MIT); RAR decoding is under the UnRAR license (and not MIT). See `LICENSES/`. On this Linux machine: the Linux core and Qt shell (`./scripts/build-linux.sh`), a Windows CLI (`./scripts/build-windows.sh`, Wine-tested), a Windows Qt exe (`./scripts/build-windows-qt.sh`, linked, process stayed up under Wine), and Android arm64 `.so` files (`./scripts/build-android.sh`). macOS was not built; a Mac is required. No Android APK was built.
