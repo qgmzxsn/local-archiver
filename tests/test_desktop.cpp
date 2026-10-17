@@ -1,5 +1,6 @@
 #include "MainWindow.hpp"
 #include "extract_path.hpp"
+#include <QAbstractItemModel>
 #include <QApplication>
 #include <QDir>
 #include <QFile>
@@ -84,6 +85,7 @@ class DesktopTests : public QObject {
       if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
         if (auto *edit = dialog->findChild<QLineEdit *>("passwordEdit")) {
           ++prompts;
+          QCOMPARE(edit->echoMode(), QLineEdit::Normal);
           edit->setText(password);
           dialog->accept();
         }
@@ -228,6 +230,34 @@ class DesktopTests : public QObject {
     QVERIFY(QFile::exists(temp.path() + "/out/inner.zip"));
     QVERIFY(!QFile::exists(temp.path() + "/out/hello.txt"));
     QVERIFY(window.findChild<QLabel *>("statusLabel")->text().contains(QStringLiteral("解压完成")));
+  }
+  void doubleClickStartsQuickExtract() {
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString archive = temp.path() + "/quick.zip";
+    QVERIFY(makeArchive(temp.path(), archive, "quick contents"));
+    MainWindow window;
+    window.show();
+    auto *pathBar = window.findChild<QLineEdit *>("pathBar");
+    QVERIFY(pathBar);
+    pathBar->setText(QDir::toNativeSeparators(temp.path()));
+    QTest::keyClick(pathBar, Qt::Key_Return);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    auto *table = window.findChild<QTableView *>("archiveTable");
+    QVERIFY(table);
+    QTest::qWait(50);
+    QModelIndex target;
+    for (int row = 0; row < table->model()->rowCount(); ++row) {
+      const QModelIndex index = table->model()->index(row, 0);
+      if (index.data().toString() == QStringLiteral("quick.zip")) { target = index; break; }
+    }
+    QVERIFY(target.isValid());
+    QTest::mouseDClick(table->viewport(), Qt::LeftButton, Qt::NoModifier,
+                       table->visualRect(target).center());
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 15000);
+    QFile output(temp.path() + "/quick/hello.txt");
+    QVERIFY(output.open(QIODevice::ReadOnly));
+    QCOMPARE(output.readAll(), QByteArray("quick contents"));
   }
   void uiPreview() {
     const QString outputDir = qEnvironmentVariable("ARCHIVER_UI_PREVIEW_DIR");

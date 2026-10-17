@@ -19,7 +19,8 @@ class MainWindow : public QMainWindow {
  public:
   explicit MainWindow(QWidget *parent = nullptr);
   ~MainWindow() override;
-  void openPath(const QString &path);
+  void openPath(QString path);
+  void quickExtract(const QString &path);
   bool isBusy() const { return busy_; }
  protected:
   void dragEnterEvent(QDragEnterEvent *event) override;
@@ -36,7 +37,8 @@ class MainWindow : public QMainWindow {
   void showInfo();
   void showPasswordBook();
   void startOpen(const QString &path, std::shared_ptr<DesktopSecret> secret = {}, bool save = false);
-  void startExtract(const QString &dest, bool nested, std::shared_ptr<DesktopSecret> secret = {});
+  void startExtract(const QString &sourcePath, const QString &dest, bool nested,
+                    std::shared_ptr<DesktopSecret> secret = {}, bool quick = false);
   void setBusy(bool busy, bool extracting = false);
   void refreshProgress();
   void cancelExtraction();

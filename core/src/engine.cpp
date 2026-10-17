@@ -62,6 +62,12 @@
 constexpr uint64_t kWriteCap = 64ull << 30;
 constexpr uint32_t kMaxEntries = 1000000;
 constexpr size_t kMaxSymlink = 4096;
+/* Disguised archives are normally glued to the end of the carrier. Scanning
+   only a tail window avoids reading an entire multi-gigabyte video. */
+constexpr uint64_t kDisguiseScanWindow = 32ull << 20;
+/* Nested discovery only needs to recognize a probable inner archive; keep the
+   probe cheap for large media payloads. */
+constexpr uint64_t kNestedProbeScanWindow = 4ull << 20;
 
 void wipe_bytes(void *data, size_t size) {
   volatile unsigned char *p = static_cast<volatile unsigned char *>(data);
@@ -529,15 +535,20 @@ class FileInStream Z7_final : public IInStream,
   uint64_t view_base = 0;
   uint64_t view_size = 0;
   uint64_t view_pos = 0;
+  /* Current OS file position. Sequential reads keep it in sync so a read
+     does not need an extra SetFilePointer/lseek call. */
+  uint64_t phys_pos = 0;
 
   bool seek_phys(uint64_t pos) {
 #if defined(_WIN32)
     LARGE_INTEGER move;
     move.QuadPart = static_cast<LONGLONG>(pos);
-    return ::SetFilePointerEx(handle, move, nullptr, FILE_BEGIN) != 0;
+    if (!::SetFilePointerEx(handle, move, nullptr, FILE_BEGIN)) return false;
 #else
-    return ::lseek(fd, static_cast<off_t>(pos), SEEK_SET) >= 0;
+    if (::lseek(fd, static_cast<off_t>(pos), SEEK_SET) < 0) return false;
 #endif
+    phys_pos = pos;
+    return true;
   }
 };
 
@@ -548,16 +559,19 @@ Z7_COM7F_IMF(FileInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
   uint32_t want = size;
   if (static_cast<uint64_t>(want) > remain) want = static_cast<uint32_t>(remain);
   if (want == 0) return S_OK;
-  if (!seek_phys(view_base + view_pos)) return E_FAIL;
+  const uint64_t physical = view_base + view_pos;
+  if (phys_pos != physical && !seek_phys(physical)) return E_FAIL;
 #if defined(_WIN32)
   DWORD got = 0;
   if (!::ReadFile(handle, data, want, &got, nullptr)) return E_FAIL;
   view_pos += got;
+  phys_pos += got;
   if (processedSize) *processedSize = static_cast<UInt32>(got);
 #else
   ssize_t n = ::read(fd, data, want);
   if (n < 0) return E_FAIL;
   view_pos += static_cast<uint64_t>(n);
+  phys_pos += static_cast<uint64_t>(n);
   if (processedSize) *processedSize = static_cast<UInt32>(n);
 #endif
   return S_OK;
@@ -1836,10 +1850,11 @@ struct SliceHit {
   uint64_t offset;
 };
 
-void remember_hit(std::vector<SliceHit> &hits, Kind kind, uint64_t offset) {
+void remember_hit(std::vector<SliceHit> &hits, Kind kind, uint64_t offset, size_t max = 0) {
   for (const SliceHit &hit : hits) {
     if (hit.kind == kind && hit.offset == offset) return;
   }
+  if (max && hits.size() >= max) hits.erase(hits.begin());
   hits.push_back(SliceHit{kind, offset});
 }
 
@@ -1921,11 +1936,11 @@ bool zip_start_from_eocd(const std::string &path, uint64_t file_size, uint64_t *
   return false;
 }
 
-void scan_appended_signatures(const std::string &path, uint64_t file_size, std::vector<SliceHit> &jpeg,
-                              std::vector<SliceHit> &tail) {
+void scan_appended_signatures(const std::string &path, uint64_t begin, uint64_t file_size,
+                              std::vector<SliceHit> &jpeg, std::vector<SliceHit> &tail) {
   const uint64_t overlap = 16;
   std::vector<unsigned char> buf(1u << 20);
-  uint64_t pos = 0;
+  uint64_t pos = begin;
   while (pos < file_size) {
     size_t want = buf.size();
     if (file_size - pos < want) want = static_cast<size_t>(file_size - pos);
@@ -1935,14 +1950,14 @@ void scan_appended_signatures(const std::string &path, uint64_t file_size, std::
       uint64_t off = pos + i;
       if (off == 0) continue;
       const unsigned char *p = buf.data() + i;
-      if (is_7z_sig(p)) remember_hit(tail, Kind::SevenZ, off);
-      else if (i + 7 <= got && is_rar_sig(p)) remember_hit(tail, Kind::Rar, off);
+      if (is_7z_sig(p)) remember_hit(tail, Kind::SevenZ, off, 64);
+      else if (i + 7 <= got && is_rar_sig(p)) remember_hit(tail, Kind::Rar, off, 64);
       if (p[0] == 0xFF && p[1] == 0xD9) {
         const unsigned char *next = p + 2;
         uint64_t after = off + 2;
-        if (i + 6 <= got && is_zip_local(next)) remember_hit(jpeg, Kind::Zip, after);
-        else if (i + 8 <= got && is_7z_sig(next)) remember_hit(jpeg, Kind::SevenZ, after);
-        else if (i + 9 <= got && is_rar_sig(next)) remember_hit(jpeg, Kind::Rar, after);
+        if (i + 6 <= got && is_zip_local(next)) remember_hit(jpeg, Kind::Zip, after, 64);
+        else if (i + 8 <= got && is_7z_sig(next)) remember_hit(jpeg, Kind::SevenZ, after, 64);
+        else if (i + 9 <= got && is_rar_sig(next)) remember_hit(jpeg, Kind::Rar, after, 64);
       }
     }
     if (pos + got >= file_size) break;
@@ -1953,7 +1968,8 @@ void scan_appended_signatures(const std::string &path, uint64_t file_size, std::
   if (tail.size() > 32) tail.erase(tail.begin(), tail.end() - 32);
 }
 
-ArchiverResult open_disguised(ArchiverArchive *archive, const std::string &path, PasswordState &password) {
+ArchiverResult open_disguised(ArchiverArchive *archive, const std::string &path, PasswordState &password,
+                              uint64_t scan_window) {
   std::vector<SliceHit> hits;
   unsigned char head[8];
   memset(head, 0, sizeof(head));
@@ -1973,10 +1989,11 @@ ArchiverResult open_disguised(ArchiverArchive *archive, const std::string &path,
 
   std::vector<SliceHit> jpeg;
   std::vector<SliceHit> tail;
-  /* Header hits are enough for a renamed file. Still scan when the header is
-     media, and also when a header match might be a false start before a real tail. */
+  /* Header hits are enough for a renamed file. Only a tail window is scanned
+     for an archive appended to a large media file. */
   if (hits.empty() || hits[0].offset != 0) {
-    scan_appended_signatures(path, file_size, jpeg, tail);
+    const uint64_t scan_from = file_size > scan_window ? file_size - scan_window : 0;
+    scan_appended_signatures(path, scan_from, file_size, jpeg, tail);
     for (const SliceHit &hit : jpeg) remember_hit(hits, hit.kind, hit.offset);
     for (size_t i = tail.size(); i > 0; --i) remember_hit(hits, tail[i - 1].kind, tail[i - 1].offset);
   }
@@ -2019,8 +2036,9 @@ std::string leading_volume(const std::string &path) {
   return path;
 }
 
-ArchiverResult archiver_open(const char *input_path, const char *engine_path, const char *password,
-                             ArchiverArchive **out) {
+ArchiverResult open_archive_impl(const char *input_path, const char *engine_path,
+                                 const char *password, ArchiverArchive **out,
+                                 uint64_t scan_window) {
   if (!out) return ARCHIVER_ERR_ARGUMENT;
   *out = nullptr;
   if (!input_path || !input_path[0]) return ARCHIVER_ERR_ARGUMENT;
@@ -2059,7 +2077,7 @@ ArchiverResult archiver_open(const char *input_path, const char *engine_path, co
 
   ArchiverResult result = ARCHIVER_OK;
   if (disguise) {
-    result = open_disguised(archive.get(), archive_path, pw);
+    result = open_disguised(archive.get(), archive_path, pw, scan_window);
   } else if (kind == Kind::TarGz || kind == Kind::TarBz2 || kind == Kind::TarXz || kind == Kind::TarZst) {
     result = open_kind(archive.get(), kind, archive_path, pw);
     if (result == ARCHIVER_OK) {
@@ -2110,6 +2128,11 @@ ArchiverResult archiver_open(const char *input_path, const char *engine_path, co
   }
   *out = archive.release();
   return result;
+}
+
+ArchiverResult archiver_open(const char *input_path, const char *engine_path, const char *password,
+                             ArchiverArchive **out) {
+  return open_archive_impl(input_path, engine_path, password, out, kDisguiseScanWindow);
 }
 
 ArchiverResult archiver_entry_count(const ArchiverArchive *archive, uint32_t *count) {
@@ -2687,7 +2710,8 @@ ArchiverResult nested_extract(const std::string &path, const char *engine, const
     if (classify(rel) == Kind::Unsupported && !is_disguise_carrier(rel)) continue;
     if (progress && progress(0, 0, progress_user)) return ARCHIVER_ERR_CANCELLED;
     ArchiverArchive *inner = nullptr;
-    ArchiverResult trial = archiver_open(join_dir(dest, rel).c_str(), engine, nullptr, &inner);
+    ArchiverResult trial = open_archive_impl(join_dir(dest, rel).c_str(), engine, nullptr, &inner,
+                                             kNestedProbeScanWindow);
     bool is_archive = trial == ARCHIVER_OK || trial == ARCHIVER_ERR_PASSWORD_REQUIRED ||
                       trial == ARCHIVER_ERR_PASSWORD || trial == ARCHIVER_ERR_MISSING_VOLUME;
     if (!is_archive && classify(rel) != Kind::Unsupported) {

@@ -2,9 +2,9 @@
 
 离线打开、浏览和解压本机压缩包的 Windows 桌面程序。文件和密码都在本机处理，无需账号，不上传文件，也不会运行解压出的程序。
 
-当前版本：[**v0.4.0**](https://github.com/qgmzxsn/local-archiver/releases/tag/v0.4.0)。
+当前版本：[**v0.5.0**](https://github.com/qgmzxsn/local-archiver/releases/tag/v0.5.0)。
 
-[**下载 Windows 64 位便携版**](https://github.com/qgmzxsn/local-archiver/releases/download/v0.4.0/LocalArchiver-0.4.0-windows-x64-portable.zip) · [校验文件](https://github.com/qgmzxsn/local-archiver/releases/download/v0.4.0/SHA256SUMS.txt)
+[**下载 Windows 64 位便携版**](https://github.com/qgmzxsn/local-archiver/releases/download/v0.5.0/LocalArchiver-0.5.0-windows-x64-portable.zip) · [校验文件](https://github.com/qgmzxsn/local-archiver/releases/download/v0.5.0/SHA256SUMS.txt)
 
 完整解压 ZIP 后运行 `local-archiver.exe`，保留旁边所有 DLL、platforms 和许可文件。无需另装 Qt 或 7-Zip。v0.3.0 保留在历史发行版中。
 
@@ -26,13 +26,13 @@
 
 工具栏或“工具 → 密码本”可添加、修改、删除、排序，也可导入 UTF-8 文本（每行一个密码，保留前后空格，忽略空行和重复项）。点击“保存”才生效。
 
-最多保存 64 条，每条最多 1024 UTF-8 字节。使用 **Windows 凭据管理器**，每条密码单独保存；原有 0.3.0 密码本会在下次保存时迁移。先按顺序快速验证候选密码，全部不匹配后才询问。弹窗中勾选保存的密码仅在验证成功后写入。密码不写入日志或命令行。不进行密码破解。
+最多保存 64 条，每条最多 1024 UTF-8 字节。使用 **Windows 凭据管理器**，每条密码单独保存；原有 0.3.0 密码本会在下次保存时迁移。先按顺序快速验证候选密码，全部不匹配后才询问。解压密码输入框以明文显示；弹窗中勾选保存的密码仅在验证成功后写入。密码不写入日志或命令行。不进行密码破解。
 
 其他系统可编译核心与 Qt 界面，但尚不提供持久密码本，也没有正式发布包。
 
 ## 界面
 
-参考 7-Zip 的菜单、图标工具栏、地址栏和详细文件列表：双击或 Enter 进入目录，Alt+↑ 返回，点击表头排序，Ctrl+O 打开，Ctrl+A 全选。工具栏提供添加、解压、测试、打开、信息和密码本。解压与测试在后台运行；解压支持进度和取消。“添加”目前仅创建无压缩 ZIP，不能创建 RAR。
+参考 7-Zip 的菜单、图标工具栏、地址栏和详细文件列表：双击目录或按 Enter 进入目录，Alt+↑ 返回，点击表头排序，Ctrl+O 打开，Ctrl+A 全选。**在文件列表中双击压缩包或伪装文件会直接解压到同目录的同名文件夹**（已存在时自动加序号），默认嵌套解压到底，只有需要新密码时才弹窗；工具栏“打开”仍用于浏览压缩包内容。工具栏提供添加、解压、测试、打开、信息和密码本。解压与测试在后台运行；解压支持进度和取消。“添加”目前仅创建无压缩 ZIP，不能创建 RAR。
 
 ## 构建与验证
 

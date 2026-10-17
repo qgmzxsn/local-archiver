@@ -1,6 +1,6 @@
 # Windows releases
 
-The supported release toolchain for 0.2.0 is Qt 6.8.3 and its matching MinGW-w64
+The supported release toolchain for 0.5.0 is Qt 6.8.3 and its matching MinGW-w64
 13.1 POSIX/SEH kit, with the official 7-Zip 26.04 x64 `7z.dll`.
 
 Keep build dependencies outside Git. The native script downloads the pinned
@@ -14,7 +14,7 @@ test tools, not end-user runtime dependencies.
 
 py scripts/package-windows.py --build-dir build-windows-qt `
   --qt-dir C:/deps/Qt --compiler-dir C:/deps/mingw1310_64 `
-  --sevenzip-dll C:/deps/7zip/7z.dll --output-dir C:/releases/0.2.0 `
+  --sevenzip-dll C:/deps/7zip/7z.dll --output-dir C:/releases/0.5.0 `
   --makensis C:/deps/nsis/makensis.exe
 ```
 
@@ -24,13 +24,13 @@ documents, and the independent runtime DLLs. The stage directory must be new.
 
 The script produces:
 
-- `LocalArchiver-0.2.0-windows-x64-setup.exe`: per-user installation, Start menu
+- `LocalArchiver-0.5.0-windows-x64-setup.exe`: per-user installation, Start menu
   shortcuts and an uninstall entry, without administrator access.
-- `LocalArchiver-0.2.0-windows-x64-portable.zip`: extract the entire folder and run
+- `LocalArchiver-0.5.0-windows-x64-portable.zip`: extract the entire folder and run
   `local-archiver.exe`.
-- `LocalArchiver-0.2.0-source.zip`: current source, including uncommitted edits;
+- `LocalArchiver-0.5.0-source.zip`: current source, including uncommitted edits;
   no build outputs, compiler, downloaded 7-Zip source or private Git metadata.
-- `LocalArchiver-0.2.0-SHA256SUMS.txt`: binary/source asset hashes.
+- `LocalArchiver-0.5.0-SHA256SUMS.txt`: binary/source asset hashes.
 
 Installer testing can use `/S /NOINTEGRATION /D=C:\test-directory`. This installs
 files without Start menu or registry integration. The normal interactive
@@ -44,5 +44,5 @@ source snapshots, not compiled applications. The build and package scripts do
 not upload anything automatically. Publish only after verifying that the source
 ZIP matches the tagged commit and the SHA-256 manifest matches all three assets.
 
-For 0.2.0, use tag `v0.2.0` and attach the four files listed above to
-<https://github.com/qgmzxsn/local-archiver/releases/tag/v0.2.0>.
+For 0.5.0, use tag `v0.5.0` and attach the four files listed above to
+<https://github.com/qgmzxsn/local-archiver/releases/tag/v0.5.0>.

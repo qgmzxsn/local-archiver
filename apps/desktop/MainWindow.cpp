@@ -553,7 +553,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     askLayers_ = mode->currentIndex() == 1;
     keepIntermediate_ = keep->isChecked();
     nestedByteLimitGiB_ = limit->currentIndex() == 1 ? 4 : limit->currentIndex() == 2 ? 16 : 64;
-    startExtract(normalizeExtractDirectory(edit->text(), archivePath_), nested->isChecked());
+    startExtract(archivePath_, normalizeExtractDirectory(edit->text(), archivePath_), nested->isChecked());
   });
   connect(testButton_, &QPushButton::clicked, this, &MainWindow::testArchive);
   connect(infoButton_, &QPushButton::clicked, this, &MainWindow::showInfo);
@@ -713,11 +713,20 @@ void MainWindow::activateRow(const QModelIndex &index) {
     return;
   }
   if (insideArchive_) {
-    if (row->directory) enterArchiveFolder(row->path.endsWith(QLatin1Char('/')) ? row->path : row->path + QLatin1Char('/'));
+    if (row->directory) {
+      const QString path = row->path;
+      enterArchiveFolder(path.endsWith(QLatin1Char('/')) ? path : path + QLatin1Char('/'));
+    }
     return;
   }
-  if (row->directory) browseDirectory(row->path);
-  else if (row->archive || looksLikeArchive(row->name)) openPath(row->path);
+  if (row->directory) {
+    const QString path = row->path;
+    browseDirectory(path);
+  } else if (row->archive || looksLikeArchive(row->name)) {
+    // Copy before any model reset; rows_ owns the original string.
+    const QString path = row->path;
+    quickExtract(path);
+  }
 }
 
 void MainWindow::chooseArchive() {
@@ -913,12 +922,13 @@ void MainWindow::showPasswordBook() {
   wipeList(items);
 }
 
-void MainWindow::openPath(const QString &path) {
+void MainWindow::openPath(QString path) {
   if (busy_) return;
   if (!QFileInfo(path).isFile()) {
     showError(ARCHIVER_ERR_IO, {});
     return;
   }
+  // path is a copy: clearing the model below must not invalidate it.
   archive_.reset();
   model_->setRows({});
   archiveRows_.clear();
@@ -929,6 +939,29 @@ void MainWindow::openPath(const QString &path) {
   pathBar_->setText(QDir::toNativeSeparators(archivePath_));
   setWindowTitle(QFileInfo(path).fileName() + QStringLiteral(" — 本地归档"));
   startOpen(archivePath_);
+}
+
+void MainWindow::quickExtract(const QString &source) {
+  if (busy_) return;
+  const QString path = source;
+  if (!QFileInfo(path).isFile()) {
+    showError(ARCHIVER_ERR_IO, {});
+    return;
+  }
+  QString dest = suggestedExtractDirectory(path);
+  if (QFileInfo::exists(dest)) {
+    const QFileInfo base(dest);
+    const QString parent = base.absolutePath();
+    const QString name = base.fileName();
+    int suffix = 2;
+    do {
+      dest = QDir(parent).filePath(QStringLiteral("%1 (%2)").arg(name).arg(suffix));
+      ++suffix;
+    } while (QFileInfo::exists(dest) && suffix < 1000);
+  }
+  // Defaults: nested to the depth limit, no layer prompts, no intermediate
+  // archives. The only dialog this can open is the password prompt.
+  startExtract(path, dest, true, {}, true);
 }
 
 std::shared_ptr<DesktopSecret> MainWindow::askPassword(bool rejected, bool *save) {
@@ -942,7 +975,7 @@ std::shared_ptr<DesktopSecret> MainWindow::askPassword(bool rejected, bool *save
       : QStringLiteral("已尝试本次密码和本地密码本，请输入其他密码。"), &dialog));
   auto *edit = new QLineEdit(&dialog);
   edit->setObjectName(QStringLiteral("passwordEdit"));
-  edit->setEchoMode(QLineEdit::Password);
+  edit->setEchoMode(QLineEdit::Normal);
   layout->addWidget(edit);
   auto *keep = new QCheckBox(QStringLiteral("验证成功后保存到本地密码本"), &dialog);
   keep->setVisible(PasswordBook::available());
@@ -1062,21 +1095,23 @@ void MainWindow::startOpen(const QString &path, std::shared_ptr<DesktopSecret> s
   }));
 }
 
-void MainWindow::startExtract(const QString &dest, bool nested, std::shared_ptr<DesktopSecret> secret) {
-  if (busy_ || !archive_) return;
+void MainWindow::startExtract(const QString &sourcePath, const QString &dest, bool nested,
+                              std::shared_ptr<DesktopSecret> secret, bool quick) {
+  if (busy_ || sourcePath.isEmpty()) return;
   if (dest.isEmpty() || !QDir::isAbsolutePath(dest)) {
     status_->setText(QStringLiteral("请选择一个完整的输出文件夹路径。"));
     return;
   }
   auto session = archive_;
-  if (!secret) secret = session->secret;
+  if (!secret && session) secret = session->secret;
   work_ = std::make_shared<DesktopWorkState>();
   auto state = work_;
-  const QString path = archivePath_;
-  const int depth = nested ? nestedDepth_ : 1;
-  const bool askLayers = nested && askLayers_;
-  const bool keep = keepIntermediate_;
-  const uint64_t byteLimit = static_cast<uint64_t>(nestedByteLimitGiB_) << 30;
+  const QString path = sourcePath;
+  const int depth = quick ? 32 : (nested ? nestedDepth_ : 1);
+  const bool askLayers = !quick && nested && askLayers_;
+  const bool keep = quick ? false : keepIntermediate_;
+  const uint64_t byteLimit = quick ? (64ull << 30)
+                                   : static_cast<uint64_t>(nestedByteLimitGiB_) << 30;
   setBusy(true, true);
   status_->setText(QStringLiteral("正在解压…"));
   auto *watcher = new QFutureWatcher<ExtractResult>(this);
@@ -1092,7 +1127,7 @@ void MainWindow::startExtract(const QString &dest, bool nested, std::shared_ptr<
     if (result.passwordSaveFailed)
       QMessageBox::warning(this, QStringLiteral("密码未保存"), QStringLiteral("密码已验证，但密码本已满或无法写入。"));
   });
-  watcher->setFuture(QtConcurrent::run([this, session, secret, state, dest, path, depth, askLayers, keep, byteLimit] {
+  watcher->setFuture(QtConcurrent::run([this, secret, state, dest, path, depth, askLayers, keep, byteLimit] {
     ExtractResult result;
     QVector<QByteArray> book = PasswordBook::load();
     if (secret && !book.contains(secret->bytes)) book.prepend(secret->bytes);
