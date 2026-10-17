@@ -46,8 +46,13 @@ if(NOT CMAKE_CROSSCOMPILING AND ARCHIVER_TEST_ENGINE AND ARCHIVER_TEST_7Z)
     add_test(NAME desktop_workflows
       COMMAND test_desktop "${ARCHIVER_TEST_7Z}" "${ARCHIVER_TEST_ENGINE}")
     get_filename_component(qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
+    set(desktop_test_platform offscreen)
+    if(WIN32)
+      # Exercise the same native integration/font engine as the shipped app.
+      set(desktop_test_platform windows)
+    endif()
     set_tests_properties(desktop_workflows PROPERTIES
-      ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=${qt_prefix}/plugins"
+      ENVIRONMENT "QT_QPA_PLATFORM=${desktop_test_platform};QT_PLUGIN_PATH=${qt_prefix}/plugins"
       TIMEOUT 60)
   endif()
 endif()
