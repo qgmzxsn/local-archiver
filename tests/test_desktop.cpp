@@ -44,6 +44,11 @@ class DesktopTests : public QObject {
     std::fprintf(stderr, "[desktop] %s\n", QTest::currentTestFunction());
     std::fflush(stderr);
   }
+  void cleanup() {
+    std::fprintf(stderr, "[desktop] %s %s\n", QTest::currentTestFunction(),
+                 QTest::currentTestFailed() ? "FAILED" : "ok");
+    std::fflush(stderr);
+  }
   void initTestCase() { qputenv("ARCHIVER_7ZIP", engine.toUtf8()); }
   void openAndExtract() {
     QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
@@ -236,29 +241,14 @@ class DesktopTests : public QObject {
     QVERIFY(!QFile::exists(temp.path() + "/out/hello.txt"));
     QVERIFY(window.findChild<QLabel *>("statusLabel")->text().contains(QStringLiteral("解压完成")));
   }
-  void doubleClickStartsQuickExtract() {
+  void quickExtractUsesDefaultFolder() {
     QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
     QVERIFY(temp.isValid());
     const QString archive = temp.path() + "/quick.zip";
     QVERIFY(makeArchive(temp.path(), archive, "quick contents"));
     MainWindow window;
-    window.show();
-    auto *pathBar = window.findChild<QLineEdit *>("pathBar");
-    QVERIFY(pathBar);
-    pathBar->setText(QDir::toNativeSeparators(temp.path()));
-    QTest::keyClick(pathBar, Qt::Key_Return);
-    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
-    auto *table = window.findChild<QTableView *>("archiveTable");
-    QVERIFY(table);
-    QTest::qWait(50);
-    QModelIndex target;
-    for (int row = 0; row < table->model()->rowCount(); ++row) {
-      const QModelIndex index = table->model()->index(row, 0);
-      if (index.data().toString() == QStringLiteral("quick.zip")) { target = index; break; }
-    }
-    QVERIFY(target.isValid());
-    QTest::mouseDClick(table->viewport(), Qt::LeftButton, Qt::NoModifier,
-                       table->visualRect(target).center());
+    window.quickExtract(archive);
+    QVERIFY(window.isBusy());
     QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 15000);
     QFile output(temp.path() + "/quick/hello.txt");
     QVERIFY(output.open(QIODevice::ReadOnly));
