@@ -19,6 +19,7 @@
 #include <QTimer>
 #include <QUuid>
 #include <QtTest>
+#include <cstdio>
 
 static QString sevenZip;
 static QString engine;
@@ -39,6 +40,10 @@ class DesktopTests : public QObject {
     return process.waitForFinished(15000) && process.exitCode() == 0;
   }
  private slots:
+  void init() {
+    std::fprintf(stderr, "[desktop] %s\n", QTest::currentTestFunction());
+    std::fflush(stderr);
+  }
   void initTestCase() { qputenv("ARCHIVER_7ZIP", engine.toUtf8()); }
   void openAndExtract() {
     QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
@@ -357,6 +362,9 @@ int main(int argc, char **argv) {
   sevenZip = args[1];
   engine = args[2];
   DesktopTests tests;
-  return QTest::qExec(&tests, 1, argv);
+  const int result = QTest::qExec(&tests, 1, argv);
+  std::fflush(stdout);
+  std::fflush(stderr);
+  return result;
 }
 #include "test_desktop.moc"
