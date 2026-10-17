@@ -7,6 +7,14 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QCollator>
+#include <QComboBox>
+#include <QFile>
+#include <QFormLayout>
+#include <QPainter>
+#include <QSpinBox>
+#include <QStyle>
+#include <QStyleOptionButton>
 #include <QCloseEvent>
 #include <QDateTime>
 #include <QDialog>
@@ -40,6 +48,8 @@
 #include <algorithm>
 #include <atomic>
 #include <exception>
+#include <functional>
+#include <cstring>
 
 struct DesktopSecret {
   QByteArray bytes;
@@ -95,10 +105,13 @@ class ArchiveModel final : public QAbstractTableModel {
     if (role == Qt::TextAlignmentRole && (index.column() == 1 || index.column() == 2))
       return static_cast<int>(Qt::AlignRight | Qt::AlignVCenter);
     if (role == Qt::ToolTipRole) return row.path;
+    if (role == Qt::DecorationRole && index.column() == 0)
+      return QApplication::style()->standardIcon(row.parent ? QStyle::SP_ArrowUp :
+          row.directory ? QStyle::SP_DirIcon : QStyle::SP_FileIcon);
     if (role != Qt::DisplayRole) return {};
     if (index.column() == 0) return row.name;
     if (index.column() == 1) {
-      if (row.parent) return {};
+      if (row.parent || row.directory) return {};
       return QLocale().formattedDataSize(row.size);
     }
     if (index.column() == 2) {
@@ -115,6 +128,14 @@ class ArchiveModel final : public QAbstractTableModel {
   void setRows(QVector<ArchiveRow> rows) {
     beginResetModel();
     rows_ = std::move(rows);
+    sortRows();
+    endResetModel();
+  }
+  void sort(int column, Qt::SortOrder order) override {
+    beginResetModel();
+    sortColumn_ = column;
+    sortOrder_ = order;
+    sortRows();
     endResetModel();
   }
   uint64_t totalSize() const {
@@ -124,10 +145,102 @@ class ArchiveModel final : public QAbstractTableModel {
     return total;
   }
  private:
+  int sortColumn_ = 0;
+  Qt::SortOrder sortOrder_ = Qt::AscendingOrder;
+  void sortRows() {
+    QCollator collator;
+    collator.setNumericMode(true);
+    collator.setCaseSensitivity(Qt::CaseInsensitive);
+    std::stable_sort(rows_.begin(), rows_.end(), [&](const ArchiveRow &a, const ArchiveRow &b) {
+      if (a.parent != b.parent) return a.parent;
+      if (a.directory != b.directory) return a.directory;
+      int compare = 0;
+      if (sortColumn_ == 1) compare = (a.size > b.size) - (a.size < b.size);
+      else if (sortColumn_ == 2) compare = (a.packed > b.packed) - (a.packed < b.packed);
+      else if (sortColumn_ == 3) compare = (a.modified > b.modified) - (a.modified < b.modified);
+      else compare = collator.compare(a.name, b.name);
+      return sortOrder_ == Qt::AscendingOrder ? compare < 0 : compare > 0;
+    });
+  }
   QVector<ArchiveRow> rows_;
 };
 
 namespace {
+void chineseButtons(QDialogButtonBox *buttons) {
+  for (const auto &pair : {std::make_pair(QDialogButtonBox::Ok, "确定"),
+      std::make_pair(QDialogButtonBox::Cancel, "取消"), std::make_pair(QDialogButtonBox::Save, "保存"),
+      std::make_pair(QDialogButtonBox::Close, "关闭")})
+    if (auto *button = buttons->button(pair.first)) button->setText(QString::fromUtf8(pair.second));
+}
+
+QIcon commandIcon(const QString &name) {
+  QPixmap pixmap(64, 64);
+  pixmap.fill(Qt::transparent);
+  QPainter p(&pixmap);
+  p.setRenderHint(QPainter::Antialiasing);
+  p.scale(2, 2);
+  p.setPen(QPen(QColor("#a16a21"), 1.5));
+  p.setBrush(QColor("#f3cb78"));
+  if (name == QLatin1String("passwordButton")) {
+    p.setPen(QPen(QColor("#ac7c1e"), 3, Qt::SolidLine, Qt::RoundCap));
+    p.setBrush(QColor("#ffe39b"));
+    p.drawEllipse(QRectF(4, 3, 12, 12));
+    p.drawLine(QPointF(14, 14), QPointF(27, 27));
+    p.drawLine(QPointF(22, 22), QPointF(26, 18));
+    p.drawLine(QPointF(25, 25), QPointF(29, 21));
+  } else if (name == QLatin1String("infoButton")) {
+    p.setPen(Qt::NoPen); p.setBrush(QColor("#4584c1")); p.drawEllipse(QRectF(3, 3, 26, 26));
+    p.setPen(Qt::white); QFont font = p.font(); font.setBold(true); font.setPixelSize(23); p.setFont(font);
+    p.drawText(QRectF(3, 2, 26, 28), Qt::AlignCenter, QStringLiteral("i"));
+  } else if (name == QLatin1String("openButton")) {
+    p.drawRoundedRect(QRectF(3, 7, 24, 21), 2, 2);
+    p.setBrush(QColor("#ffdf90")); p.drawPolygon(QPolygonF{QPointF(3, 14), QPointF(30, 14), QPointF(25, 28), QPointF(3, 28)});
+  } else {
+    p.drawRoundedRect(QRectF(4, 6, 24, 22), 2, 2);
+    p.setBrush(QColor("#ffe4a5")); p.drawRect(QRectF(4, 6, 24, 6));
+    p.setPen(QPen(QColor("#287e48"), 3, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    if (name == QLatin1String("extractButton")) {
+      p.drawLine(QPointF(16, 3), QPointF(16, 21));
+      p.drawLine(QPointF(10, 15), QPointF(16, 21)); p.drawLine(QPointF(16, 21), QPointF(22, 15));
+    } else if (name == QLatin1String("testButton")) {
+      p.drawLine(QPointF(9, 19), QPointF(14, 24)); p.drawLine(QPointF(14, 24), QPointF(24, 14));
+    } else if (name == QLatin1String("addButton")) {
+      p.drawLine(QPointF(16, 14), QPointF(16, 24)); p.drawLine(QPointF(11, 19), QPointF(21, 19));
+    }
+  }
+  return QIcon(pixmap);
+}
+class CommandButton final : public QPushButton {
+ public:
+  CommandButton(const QString &text, QWidget *parent) : QPushButton(text, parent) {
+    setFixedSize(74, 66);
+    setFlat(true);
+  }
+ protected:
+  void paintEvent(QPaintEvent *) override {
+    QPainter p(this);
+    if (isEnabled() && (underMouse() || isDown() || hasFocus())) {
+      p.setPen(QColor("#b5cce4")); p.setBrush(isDown() ? QColor("#dce9f6") : QColor("#eaf2fa"));
+      p.drawRoundedRect(rect().adjusted(2, 2, -2, -2), 3, 3);
+    }
+    icon().paint(&p, QRect((width() - 30) / 2, 5, 30, 30), Qt::AlignCenter,
+                 isEnabled() ? QIcon::Normal : QIcon::Disabled);
+    p.setPen(palette().color(isEnabled() ? QPalette::Active : QPalette::Disabled, QPalette::ButtonText));
+    p.drawText(QRect(0, 39, width(), 22), Qt::AlignCenter, text());
+  }
+};
+bool savePassword(const QByteArray &secret) {
+  QVector<QByteArray> book = PasswordBook::load();
+  bool exists = book.contains(secret);
+  if (!exists) book.append(secret);
+  const bool ok = exists || PasswordBook::store(book);
+  for (auto &item : book) {
+    volatile char *data = item.data();
+    for (qsizetype i = 0; i < item.size(); ++i) data[i] = 0;
+  }
+  return ok;
+}
+
 int reportProgress(uint64_t completed, uint64_t total, void *user) {
   auto *state = static_cast<DesktopWorkState *>(user);
   state->completed.store(completed, std::memory_order_relaxed);
@@ -145,7 +258,14 @@ bool looksLikeArchive(const QString &name) {
       QStringLiteral(".rar"), QStringLiteral(".mp4"), QStringLiteral(".m4v"),
       QStringLiteral(".mov"), QStringLiteral(".jpg"), QStringLiteral(".jpeg"),
       QStringLiteral(".png"), QStringLiteral(".gif"), QStringLiteral(".bmp"),
-      QStringLiteral(".webp")};
+      QStringLiteral(".webp"), QStringLiteral(".avi"), QStringLiteral(".mkv"),
+      QStringLiteral(".webm"), QStringLiteral(".gz"), QStringLiteral(".bz2"),
+      QStringLiteral(".xz"), QStringLiteral(".zst"), QStringLiteral(".zstd"),
+      QStringLiteral(".cab"), QStringLiteral(".iso"), QStringLiteral(".udf"),
+      QStringLiteral(".wim"), QStringLiteral(".swm"), QStringLiteral(".arj"),
+      QStringLiteral(".lzh"), QStringLiteral(".lha"), QStringLiteral(".cpio"),
+      QStringLiteral(".ar"), QStringLiteral(".deb"), QStringLiteral(".rpm"),
+      QStringLiteral(".dmg"), QStringLiteral(".xar")};
   for (const auto &suffix : suffixes)
     if (lower.endsWith(suffix)) return true;
   const int dot = lower.lastIndexOf(QLatin1Char('.'));
@@ -206,6 +326,7 @@ struct OpenResult {
   int matched = -1;
 };
 struct ExtractResult {
+  bool passwordSaveFailed = false;
   ArchiverResult code = ARCHIVER_OK;
   QString detail;
 };
@@ -222,7 +343,17 @@ void wipeList(QVector<QByteArray> &items) {
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   setWindowTitle(QStringLiteral("本地归档"));
-  resize(900, 560);
+  resize(1040, 650);
+  menuBar()->setNativeMenuBar(false);
+  setStyleSheet(QStringLiteral(
+      "QMainWindow { background: #f5f6f8; }"
+      "QToolBar { background: #f5f6f8; border: 0; border-bottom: 1px solid #cbd1d9; spacing: 3px; padding: 3px 8px; }"
+      "QMenuBar { background: #fafafa; border-bottom: 1px solid #dedfe2; }"
+      "QTableView { background: white; alternate-background-color: #f6f8fb; color: #202934; border: 0; selection-background-color: #dceafa; selection-color: #102f54; }"
+      "QHeaderView::section { background: #f6f7f9; color: #4b5665; border: 0; border-bottom: 1px solid #d6dbe2; border-right: 1px solid #e2e5e9; padding: 7px 10px; }"
+      "QStatusBar { background: #f5f6f8; border-top: 1px solid #d6dbe2; }"
+      "QLineEdit#pathBar { background: white; color: #253247; border: 1px solid #cbd1d9; border-radius: 3px; padding: 5px 9px; }"
+      "QPushButton#upButton { padding: 4px 8px; }"));
   setMinimumSize(640, 400);
   setAcceptDrops(true);
 
@@ -242,6 +373,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   connect(editMenu->addAction(QStringLiteral("全选")), &QAction::triggered, this, [this] {
     table_->selectAll();
   });
+  auto *selectAll = editMenu->actions().last();
+  selectAll->setShortcut(QKeySequence::SelectAll);
   auto *viewMenu = menuBar()->addMenu(QStringLiteral("查看"));
   connect(viewMenu->addAction(QStringLiteral("向上")), &QAction::triggered, this, &MainWindow::goUp);
   auto *toolsMenu = menuBar()->addMenu(QStringLiteral("工具"));
@@ -260,7 +393,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   toolbar->setMovable(false);
   toolbar->setFloatable(false);
   auto addFlat = [&](const QString &text, const char *name) {
-    auto *button = new QPushButton(text, toolbar);
+    auto *button = new CommandButton(text, toolbar);
+    button->setIcon(commandIcon(QLatin1String(name)));
+    button->setToolTip(text);
     button->setObjectName(name);
     button->setFlat(true);
     toolbar->addWidget(button);
@@ -269,9 +404,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   addButton_ = addFlat(QStringLiteral("添加"), "addButton");
   extractButton_ = addFlat(QStringLiteral("解压"), "extractButton");
   testButton_ = addFlat(QStringLiteral("测试"), "testButton");
-  infoButton_ = addFlat(QStringLiteral("信息"), "infoButton");
+  toolbar->addSeparator();
   openButton_ = addFlat(QStringLiteral("打开"), "openButton");
-  upButton_ = addFlat(QStringLiteral("向上"), "upButton");
+  infoButton_ = addFlat(QStringLiteral("信息"), "infoButton");
+  auto *passwordButton = addFlat(QStringLiteral("密码本"), "passwordButton");
+  connect(passwordButton, &QPushButton::clicked, this, &MainWindow::showPasswordBook);
 
   auto *central = new QWidget(this);
   auto *layout = new QVBoxLayout(central);
@@ -280,7 +417,17 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   pathBar_ = new QLineEdit(central);
   pathBar_->setObjectName(QStringLiteral("pathBar"));
   pathBar_->setClearButtonEnabled(false);
-  layout->addWidget(pathBar_);
+  auto *navigation = new QHBoxLayout();
+  navigation->setContentsMargins(8, 7, 8, 7);
+  navigation->setSpacing(7);
+  upButton_ = new QPushButton(central);
+  upButton_->setIcon(style()->standardIcon(QStyle::SP_ArrowUp));
+  upButton_->setObjectName(QStringLiteral("upButton"));
+  upButton_->setToolTip(QStringLiteral("上一级（Alt+↑）"));
+  upButton_->setShortcut(QKeySequence(Qt::ALT | Qt::Key_Up));
+  navigation->addWidget(upButton_);
+  navigation->addWidget(pathBar_, 1);
+  layout->addLayout(navigation);
   model_ = new ArchiveModel(this);
   table_ = new QTableView(central);
   table_->setObjectName(QStringLiteral("archiveTable"));
@@ -289,7 +436,13 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   table_->setSelectionBehavior(QAbstractItemView::SelectRows);
   table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
   table_->setShowGrid(false);
+  table_->setAlternatingRowColors(true);
+  table_->setSortingEnabled(true);
+  table_->sortByColumn(0, Qt::AscendingOrder);
+  table_->verticalHeader()->setDefaultSectionSize(29);
+  table_->setIconSize(QSize(18, 18));
   table_->verticalHeader()->hide();
+  table_->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
   table_->horizontalHeader()->setStretchLastSection(true);
   table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
   table_->setColumnWidth(1, 110);
@@ -308,6 +461,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   status_->setObjectName(QStringLiteral("statusLabel"));
   status_->setTextFormat(Qt::PlainText);
   statusBar()->addWidget(status_, 1);
+  auto *offline = new QLabel(QStringLiteral("● 本地处理 · 无需联网"), this);
+  offline->setStyleSheet(QStringLiteral("color: #417155; padding: 4px 10px;"));
+  statusBar()->addPermanentWidget(offline);
   statusBar()->addPermanentWidget(progress_);
   statusBar()->addPermanentWidget(cancelButton_);
 
@@ -324,12 +480,41 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     auto *row = new QHBoxLayout();
     row->addWidget(edit, 1);
     row->addWidget(browse);
+    box->addWidget(new QLabel(QStringLiteral("解压到"), &dialog));
     box->addLayout(row);
-    auto *nested = new QCheckBox(QStringLiteral("穿透嵌套压缩包"), &dialog);
+    dialog.resize(560, 330);
+    auto *nested = new QCheckBox(QStringLiteral("自动解开内层压缩包，直到没有压缩包"), &dialog);
     nested->setChecked(true);
     nested->setObjectName(QStringLiteral("nestedCheck"));
     box->addWidget(nested);
+    auto *form = new QFormLayout();
+    auto *depth = new QSpinBox(&dialog);
+    depth->setObjectName(QStringLiteral("maxDepthSpin"));
+    depth->setRange(1, 32);
+    depth->setValue(nestedDepth_);
+    depth->setSuffix(QStringLiteral(" 层"));
+    form->addRow(QStringLiteral("最多解开"), depth);
+    auto *mode = new QComboBox(&dialog);
+    mode->setObjectName(QStringLiteral("nestedModeCombo"));
+    mode->addItems({QStringLiteral("全部自动解开（多个包分别存放）"), QStringLiteral("每层让我选择继续或停止")});
+    mode->setCurrentIndex(askLayers_ ? 1 : 0);
+    form->addRow(QStringLiteral("内层处理"), mode);
+    auto *limit = new QComboBox(&dialog);
+    limit->addItems({QStringLiteral("64 GiB"), QStringLiteral("4 GiB"), QStringLiteral("16 GiB")});
+    limit->setCurrentIndex(nestedByteLimitGiB_ == 4 ? 1 : nestedByteLimitGiB_ == 16 ? 2 : 0);
+    form->addRow(QStringLiteral("累计解压上限"), limit);
+    box->addLayout(form);
+    auto *keep = new QCheckBox(QStringLiteral("保留解出的中间压缩包"), &dialog);
+    keep->setChecked(keepIntermediate_);
+    box->addWidget(keep);
+    auto *note = new QLabel(QStringLiteral("原始压缩包始终保留。遇到缺卷或同名文件会停止，已解出的文件可保留。"), &dialog);
+    note->setWordWrap(true);
+    box->addWidget(note);
+    connect(nested, &QCheckBox::toggled, &dialog, [=](bool enabled) {
+      depth->setEnabled(enabled); mode->setEnabled(enabled); keep->setEnabled(enabled);
+    });
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    chineseButtons(buttons);
     auto *ok = buttons->button(QDialogButtonBox::Ok);
     ok->setObjectName(QStringLiteral("extractOk"));
     ok->setText(QStringLiteral("确定"));
@@ -343,6 +528,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     if (dialog.exec() != QDialog::Accepted) return;
+    nestedDepth_ = depth->value();
+    askLayers_ = mode->currentIndex() == 1;
+    keepIntermediate_ = keep->isChecked();
+    nestedByteLimitGiB_ = limit->currentIndex() == 1 ? 4 : limit->currentIndex() == 2 ? 16 : 64;
     startExtract(normalizeExtractDirectory(edit->text(), archivePath_), nested->isChecked());
   });
   connect(testButton_, &QPushButton::clicked, this, &MainWindow::testArchive);
@@ -356,6 +545,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     else if (info.isFile()) openPath(info.absoluteFilePath());
   });
   connect(table_, &QTableView::doubleClicked, this, &MainWindow::activateRow);
+  auto *enter = new QAction(this);
+  enter->setShortcut(QKeySequence(Qt::Key_Return));
+  enter->setShortcutContext(Qt::WidgetShortcut);
+  table_->addAction(enter);
+  connect(enter, &QAction::triggered, this, [this] { activateRow(table_->currentIndex()); });
   timer_ = new QTimer(this);
   timer_->setInterval(100);
   connect(timer_, &QTimer::timeout, this, &MainWindow::refreshProgress);
@@ -507,7 +701,7 @@ void MainWindow::chooseArchive() {
   const QString path = QFileDialog::getOpenFileName(
       this, QStringLiteral("打开"), directory_,
       QStringLiteral("压缩包 (*.zip *.7z *.tar *.tgz *.tar.gz *.tbz *.tbz2 *.tar.bz2 "
-                     "*.txz *.tar.xz *.tzst *.tar.zst *.rar *.001 *.mp4 *.jpg *.jpeg *.png);;所有文件 (*)"));
+                     "*.txz *.tar.xz *.tzst *.tar.zst *.rar *.001 *.gz *.bz2 *.xz *.zst *.cab *.iso *.udf *.wim *.swm *.arj *.lzh *.lha *.cpio *.ar *.deb *.rpm *.dmg *.xar *.mp4 *.mkv *.avi *.mov *.m4v *.webm *.jpg *.jpeg *.png *.gif *.bmp *.webp);;所有文件 (*)"));
   if (!path.isEmpty()) openPath(path);
 }
 
@@ -535,11 +729,24 @@ void MainWindow::addFiles() {
 
 void MainWindow::testArchive() {
   if (busy_ || !archive_) return;
-  const QByteArray password = archive_->secret ? archive_->secret->bytes : QByteArray();
-  const int code = archiver_test(archive_->handle, password.isEmpty() ? nullptr : password.constData());
-  const QString detail = QString::fromUtf8(archiver_message(archive_->handle));
-  if (code == ARCHIVER_OK) status_->setText(QStringLiteral("测试通过。"));
-  else showError(code, detail);
+  auto session = archive_;
+  setBusy(true);
+  status_->setText(QStringLiteral("正在测试压缩包…"));
+  auto *watcher = new QFutureWatcher<ExtractResult>(this);
+  connect(watcher, &QFutureWatcher<ExtractResult>::finished, this, [this, watcher] {
+    const auto result = watcher->result();
+    watcher->deleteLater();
+    setBusy(false);
+    if (closeAfterFinish_) { close(); return; }
+    if (result.code == ARCHIVER_OK) status_->setText(QStringLiteral("测试通过。"));
+    else showError(result.code, result.detail);
+  });
+  watcher->setFuture(QtConcurrent::run([session] {
+    ExtractResult result;
+    result.code = archiver_test(session->handle, session->secret ? session->secret->bytes.constData() : nullptr);
+    result.detail = QString::fromUtf8(archiver_message(session->handle));
+    return result;
+  }));
 }
 
 void MainWindow::showInfo() {
@@ -567,58 +774,116 @@ void MainWindow::showInfo() {
 }
 
 void MainWindow::showPasswordBook() {
+  if (busy_) return;
   if (!PasswordBook::available()) {
     QMessageBox::information(this, QStringLiteral("密码本"),
-                             QStringLiteral("密码本只保存在 Windows 凭据管理器中。"));
+                             QStringLiteral("当前发布版使用 Windows 凭据管理器保存密码。其他系统暂不提供持久密码本。"));
     return;
   }
   QVector<QByteArray> items = PasswordBook::load();
   QDialog dialog(this);
-  dialog.setWindowTitle(QStringLiteral("密码本"));
+  dialog.setWindowTitle(QStringLiteral("本地密码本"));
+  dialog.resize(480, 400);
   auto *layout = new QVBoxLayout(&dialog);
+  auto *hint = new QLabel(QStringLiteral("按列表顺序尝试，全部失败后再询问。最多 64 条，每条不超过 1024 UTF-8 字节。"), &dialog);
+  hint->setWordWrap(true);
+  layout->addWidget(hint);
   auto *list = new QListWidget(&dialog);
+  list->setObjectName(QStringLiteral("passwordList"));
   auto refill = [&] {
     list->clear();
     for (int i = 0; i < items.size(); ++i)
-      list->addItem(QStringLiteral("密码 %1").arg(i + 1));
+      list->addItem(QStringLiteral("密码 %1    ••••••••").arg(i + 1));
+  };
+  auto add = [&](const QByteArray &value) {
+    if (value.isEmpty() || value.size() > PasswordBook::maxPasswordBytes || value.contains('\0') ||
+        items.contains(value) || items.size() >= PasswordBook::maxPasswords) return false;
+    items.append(value);
+    return true;
   };
   refill();
   layout->addWidget(list);
   auto *row = new QHBoxLayout();
+  auto *create = new QPushButton(QStringLiteral("添加…"), &dialog);
+  create->setObjectName(QStringLiteral("addPasswordButton"));
+  auto *edit = new QPushButton(QStringLiteral("修改…"), &dialog);
+  auto *import = new QPushButton(QStringLiteral("导入文本…"), &dialog);
+  auto *remove = new QPushButton(QStringLiteral("删除"), &dialog);
   auto *up = new QPushButton(QStringLiteral("上移"), &dialog);
   auto *down = new QPushButton(QStringLiteral("下移"), &dialog);
-  auto *remove = new QPushButton(QStringLiteral("删除"), &dialog);
-  row->addWidget(up);
-  row->addWidget(down);
-  row->addWidget(remove);
+  for (auto *button : {create, edit, import, remove, up, down}) row->addWidget(button);
   layout->addLayout(row);
-  auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+  auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
+    chineseButtons(buttons);
   layout->addWidget(buttons);
+  connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+    if (PasswordBook::store(items)) dialog.accept();
+    else QMessageBox::warning(&dialog, QStringLiteral("保存失败"), QStringLiteral("无法写入 Windows 凭据管理器。原密码本已保留。"));
+  });
   connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-  connect(up, &QPushButton::clicked, &dialog, [&] {
-    const int rowIndex = list->currentRow();
-    if (rowIndex <= 0) return;
-    std::swap(items[rowIndex], items[rowIndex - 1]);
-    if (!PasswordBook::store(items)) showError(ARCHIVER_ERR_IO, {});
+  auto input = [&](bool editing) {
+    const int selected = list->currentRow();
+    if (editing && selected < 0) return;
+    bool accepted = false;
+    QString value = QInputDialog::getText(&dialog, editing ? QStringLiteral("修改密码") : QStringLiteral("添加密码"),
+        QStringLiteral("密码（保留前后空格）"), QLineEdit::Password, {}, &accepted);
+    if (accepted) {
+      QByteArray bytes = value.toUtf8();
+      if (editing && !bytes.isEmpty() && bytes.size() <= PasswordBook::maxPasswordBytes && !bytes.contains('\0')) {
+        volatile char *data = items[selected].data();
+        for (qsizetype i = 0; i < items[selected].size(); ++i) data[i] = 0;
+        items[selected] = bytes;
+      } else if (!editing && add(bytes)) {
+        // Added above.
+      } else QMessageBox::information(&dialog, QStringLiteral("未添加"), QStringLiteral("密码为空、重复、过长或列表已满。"));
+      volatile char *data = bytes.data();
+      for (qsizetype i = 0; i < bytes.size(); ++i) data[i] = 0;
+      refill();
+    }
+    value.fill(QChar(0));
+  };
+  connect(create, &QPushButton::clicked, &dialog, [&] { input(false); });
+  connect(edit, &QPushButton::clicked, &dialog, [&] { input(true); });
+  connect(import, &QPushButton::clicked, &dialog, [&] {
+    const QString path = QFileDialog::getOpenFileName(&dialog, QStringLiteral("导入 UTF-8 密码文本（每行一个）"), {}, QStringLiteral("文本 (*.txt);;所有文件 (*)"));
+    if (path.isEmpty()) return;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 1024 * 1024) {
+      QMessageBox::warning(&dialog, QStringLiteral("无法导入"), QStringLiteral("请选择可读且不超过 1 MiB 的 UTF-8 文本。"));
+      return;
+    }
+    QByteArray content = file.readAll();
+    if (content.startsWith("\xef\xbb\xbf")) content.remove(0, 3);
+    auto lines = content.split('\n');
+    int added = 0;
+    for (auto &line : lines) {
+      if (line.endsWith('\r')) line.chop(1);
+      // Reject invalid UTF-8 instead of silently changing a password.
+      if (QString::fromUtf8(line).toUtf8() == line && add(line)) ++added;
+      volatile char *data = line.data();
+      for (qsizetype i = 0; i < line.size(); ++i) data[i] = 0;
+    }
+    volatile char *data = content.data();
+    for (qsizetype i = 0; i < content.size(); ++i) data[i] = 0;
     refill();
-    list->setCurrentRow(rowIndex - 1);
+    QMessageBox::information(&dialog, QStringLiteral("导入完成"), QStringLiteral("已添加 %1 条。空行、重复项、过长项及超出容量的行已跳过。点击保存后生效。").arg(added));
+  });
+  connect(up, &QPushButton::clicked, &dialog, [&] {
+    const int index = list->currentRow();
+    if (index <= 0) return;
+    std::swap(items[index], items[index - 1]); refill(); list->setCurrentRow(index - 1);
   });
   connect(down, &QPushButton::clicked, &dialog, [&] {
-    const int rowIndex = list->currentRow();
-    if (rowIndex < 0 || rowIndex + 1 >= items.size()) return;
-    std::swap(items[rowIndex], items[rowIndex + 1]);
-    if (!PasswordBook::store(items)) showError(ARCHIVER_ERR_IO, {});
-    refill();
-    list->setCurrentRow(rowIndex + 1);
+    const int index = list->currentRow();
+    if (index < 0 || index + 1 >= items.size()) return;
+    std::swap(items[index], items[index + 1]); refill(); list->setCurrentRow(index + 1);
   });
   connect(remove, &QPushButton::clicked, &dialog, [&] {
-    const int rowIndex = list->currentRow();
-    if (rowIndex < 0) return;
-    volatile char *data = items[rowIndex].data();
-    for (qsizetype i = 0; i < items[rowIndex].size(); ++i) data[i] = 0;
-    items.removeAt(rowIndex);
-    if (!PasswordBook::store(items)) showError(ARCHIVER_ERR_IO, {});
-    refill();
+    const int index = list->currentRow();
+    if (index < 0) return;
+    volatile char *data = items[index].data();
+    for (qsizetype i = 0; i < items[index].size(); ++i) data[i] = 0;
+    items.removeAt(index); refill();
   });
   dialog.exec();
   wipeList(items);
@@ -644,59 +909,50 @@ void MainWindow::openPath(const QString &path) {
 
 std::shared_ptr<DesktopSecret> MainWindow::askPassword(bool rejected, bool *save) {
   if (save) *save = false;
-#if defined(_WIN32)
   QDialog dialog(this);
+  dialog.setObjectName(QStringLiteral("archivePasswordDialog"));
   dialog.setWindowTitle(QStringLiteral("压缩包密码"));
+  dialog.resize(400, 180);
   auto *layout = new QVBoxLayout(&dialog);
   layout->addWidget(new QLabel(rejected ? QStringLiteral("密码不正确，请重试。")
-                                        : QStringLiteral("请输入密码。"),
-                               &dialog));
+      : QStringLiteral("已尝试本次密码和本地密码本，请输入其他密码。"), &dialog));
   auto *edit = new QLineEdit(&dialog);
+  edit->setObjectName(QStringLiteral("passwordEdit"));
   edit->setEchoMode(QLineEdit::Password);
   layout->addWidget(edit);
-  auto *keep = new QCheckBox(QStringLiteral("保存到密码本"), &dialog);
+  auto *keep = new QCheckBox(QStringLiteral("验证成功后保存到本地密码本"), &dialog);
+  keep->setVisible(PasswordBook::available());
   layout->addWidget(keep);
   auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    chineseButtons(buttons);
+  buttons->button(QDialogButtonBox::Ok)->setObjectName(QStringLiteral("passwordOk"));
   layout->addWidget(buttons);
   connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
   connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-  if (dialog.exec() != QDialog::Accepted) return {};
+  edit->setFocus();
+  if (dialog.exec() != QDialog::Accepted) { edit->clear(); return {}; }
   if (save) *save = keep->isChecked();
   auto secret = std::make_shared<DesktopSecret>();
   secret->bytes = edit->text().toUtf8();
   edit->clear();
   return secret;
-#else
-  bool accepted = false;
-  QString password = QInputDialog::getText(
-      this, QStringLiteral("压缩包密码"),
-      rejected ? QStringLiteral("密码不正确，请重试。关闭压缩包后会清除本次密码。")
-               : QStringLiteral("请输入密码。仅在本次打开期间使用，不会保存到文件。"),
-      QLineEdit::Password, {}, &accepted);
-  if (!accepted) {
-    password.fill(QChar(0));
-    return {};
-  }
-  auto secret = std::make_shared<DesktopSecret>();
-  secret->bytes = password.toUtf8();
-  password.fill(QChar(0));
-  return secret;
-#endif
 }
 
-void MainWindow::startOpen(const QString &path, std::shared_ptr<DesktopSecret> secret) {
+void MainWindow::startOpen(const QString &path, std::shared_ptr<DesktopSecret> secret, bool save) {
   work_ = std::make_shared<DesktopWorkState>();
   auto state = work_;
   setBusy(true);
   status_->setText(QStringLiteral("正在打开…"));
   auto *watcher = new QFutureWatcher<OpenResult>(this);
-  connect(watcher, &QFutureWatcher<OpenResult>::finished, this, [this, watcher, path] {
+  connect(watcher, &QFutureWatcher<OpenResult>::finished, this, [this, watcher, path, secret, save] {
     OpenResult result = watcher->result();
     watcher->deleteLater();
     if (result.code == ARCHIVER_OK) {
       archive_ = result.session;
       insideArchive_ = true;
       archiveRows_ = result.rows;
+      if (save && secret && result.session->secret && result.session->secret->bytes == secret->bytes && !savePassword(secret->bytes))
+        QMessageBox::warning(this, QStringLiteral("密码未保存"), QStringLiteral("密码已验证，但密码本已满或无法写入。"));
     }
     setBusy(false);
     if (closeAfterFinish_) {
@@ -705,15 +961,9 @@ void MainWindow::startOpen(const QString &path, std::shared_ptr<DesktopSecret> s
     }
     if (result.code == ARCHIVER_ERR_PASSWORD_REQUIRED || result.code == ARCHIVER_ERR_PASSWORD) {
       bool save = false;
-      auto nextSecret = askPassword(result.code == ARCHIVER_ERR_PASSWORD, &save);
+      auto nextSecret = askPassword(secret != nullptr || result.code == ARCHIVER_ERR_PASSWORD, &save);
       if (nextSecret) {
-        if (save) {
-          QVector<QByteArray> book = PasswordBook::load();
-          book.append(nextSecret->bytes);
-          PasswordBook::store(book);
-          wipeList(book);
-        }
-        startOpen(path, std::move(nextSecret));
+        startOpen(path, std::move(nextSecret), save);
       } else {
         insideArchive_ = false;
         model_->setRows({});
@@ -799,77 +1049,112 @@ void MainWindow::startExtract(const QString &dest, bool nested, std::shared_ptr<
   work_ = std::make_shared<DesktopWorkState>();
   auto state = work_;
   const QString path = archivePath_;
+  const int depth = nested ? nestedDepth_ : 1;
+  const bool askLayers = nested && askLayers_;
+  const bool keep = keepIntermediate_;
+  const uint64_t byteLimit = static_cast<uint64_t>(nestedByteLimitGiB_) << 30;
   setBusy(true, true);
   status_->setText(QStringLiteral("正在解压…"));
   auto *watcher = new QFutureWatcher<ExtractResult>(this);
-  connect(watcher, &QFutureWatcher<ExtractResult>::finished, this, [this, watcher, dest, secret, session] {
+  connect(watcher, &QFutureWatcher<ExtractResult>::finished, this, [this, watcher, dest] {
     const ExtractResult result = watcher->result();
     watcher->deleteLater();
-    if (result.code == ARCHIVER_OK) session->secret = secret;
     setBusy(false);
-    if (closeAfterFinish_) {
-      close();
-      return;
-    }
-    if (result.code == ARCHIVER_ERR_PASSWORD_REQUIRED || result.code == ARCHIVER_ERR_PASSWORD) {
-      bool save = false;
-      auto nextSecret = askPassword(result.code == ARCHIVER_ERR_PASSWORD, &save);
-      if (nextSecret) {
-        if (save) {
-          QVector<QByteArray> book = PasswordBook::load();
-          book.append(nextSecret->bytes);
-          PasswordBook::store(book);
-          wipeList(book);
-        }
-        startExtract(dest, true, std::move(nextSecret));
-      } else {
-        status_->setText(QStringLiteral("已取消密码输入，可以重新开始解压。"));
-      }
-      return;
-    }
+    if (closeAfterFinish_) { close(); return; }
     if (result.code == ARCHIVER_ERR_CANCELLED)
       status_->setText(QStringLiteral("已取消解压。已完成的文件和文件夹可能保留。"));
-    else if (result.code != ARCHIVER_OK)
-      showError(result.code, result.detail);
-    else
-      status_->setText(QStringLiteral("解压完成。文件已保存到 %1").arg(QDir::toNativeSeparators(dest)));
+    else if (result.code != ARCHIVER_OK) showError(result.code, result.detail);
+    else status_->setText(QStringLiteral("解压完成。文件已保存到 %1").arg(QDir::toNativeSeparators(dest)));
+    if (result.passwordSaveFailed)
+      QMessageBox::warning(this, QStringLiteral("密码未保存"), QStringLiteral("密码已验证，但密码本已满或无法写入。"));
   });
-  watcher->setFuture(QtConcurrent::run([session, secret, state, dest, path, nested] {
+  watcher->setFuture(QtConcurrent::run([this, session, secret, state, dest, path, depth, askLayers, keep, byteLimit] {
     ExtractResult result;
     QVector<QByteArray> book = PasswordBook::load();
-    if (secret && !secret->bytes.isEmpty()) {
-      bool found = false;
-      for (const QByteArray &item : book)
-        if (item == secret->bytes) found = true;
-      if (!found) book.prepend(secret->bytes);
-    }
+    if (secret && !book.contains(secret->bytes)) book.prepend(secret->bytes);
     QVector<const char *> views;
     for (const QByteArray &item : book) views.append(item.constData());
+    struct UiCallbacks {
+      std::function<int(const char *, bool, char *, uint32_t)> password;
+      std::function<int(const char *const *, uint32_t)> choose;
+      std::shared_ptr<DesktopSecret> last;
+      bool save = false;
+      bool saveFailed = false;
+    } ui;
+    ui.password = [&](const char *archive, bool rejected, char *buffer, uint32_t capacity) {
+      if (state->cancel.load()) return 0;
+      const QString current = QFileInfo(QString::fromUtf8(archive)).fileName();
+      std::shared_ptr<DesktopSecret> entered;
+      bool save = false;
+      QMetaObject::invokeMethod(this, [&] {
+        if (closeAfterFinish_ || state->cancel.load()) return;
+        status_->setText(QStringLiteral("等待密码：%1").arg(current));
+        entered = askPassword(rejected, &save);
+      }, Qt::BlockingQueuedConnection);
+      if (!entered || state->cancel.load() || static_cast<uint32_t>(entered->bytes.size()) >= capacity) return 0;
+      memcpy(buffer, entered->bytes.constData(), entered->bytes.size());
+      buffer[entered->bytes.size()] = 0;
+      ui.last = entered; ui.save = save;
+      return 1;
+    };
+    ui.choose = [&](const char *const *paths, uint32_t count) {
+      int decision = -2;
+      QStringList choices;
+      for (uint32_t i = 0; i < count; ++i) choices.append(QString::fromUtf8(paths[i]));
+      QMetaObject::invokeMethod(this, [&] {
+        if (closeAfterFinish_ || state->cancel.load()) return;
+        QDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("发现内层压缩包"));
+        dialog.resize(520, 340);
+        auto *layout = new QVBoxLayout(&dialog);
+        layout->addWidget(new QLabel(QStringLiteral("选择继续解开的压缩包，或保留当前内容并停止。"), &dialog));
+        auto *list = new QListWidget(&dialog);
+        list->setObjectName(QStringLiteral("nestedChoiceList"));
+        list->addItems(choices); list->setCurrentRow(0); layout->addWidget(list);
+        auto *buttons = new QDialogButtonBox(&dialog);
+    chineseButtons(buttons);
+        auto *selected = buttons->addButton(QStringLiteral("解开选中包"), QDialogButtonBox::AcceptRole);
+        auto *all = buttons->addButton(QStringLiteral("全部解开"), QDialogButtonBox::ActionRole);
+        auto *stop = buttons->addButton(QStringLiteral("在此停止"), QDialogButtonBox::RejectRole);
+        selected->setObjectName(QStringLiteral("continueNestedButton"));
+        stop->setObjectName(QStringLiteral("stopNestedButton"));
+        layout->addWidget(buttons);
+        connect(selected, &QPushButton::clicked, &dialog, [&] { decision = list->currentRow(); dialog.accept(); });
+        connect(all, &QPushButton::clicked, &dialog, [&] { decision = -3; dialog.accept(); });
+        connect(stop, &QPushButton::clicked, &dialog, [&] { decision = -1; dialog.accept(); });
+        dialog.exec();
+      }, Qt::BlockingQueuedConnection);
+      return state->cancel.load() ? -2 : decision;
+    };
     try {
-      if (!QDir().mkpath(dest)) {
-        result.code = ARCHIVER_ERR_IO;
-        wipeList(book);
-        return result;
-      }
-      const QByteArray destBytes = dest.toUtf8();
-      if (nested) {
-        char message[1024];
-        message[0] = 0;
+      if (!QDir().mkpath(dest)) result.code = ARCHIVER_ERR_IO;
+      else {
         const QByteArray pathBytes = path.toUtf8();
-        result.code = archiver_extract_nested(
-            pathBytes.constData(), nullptr, destBytes.constData(),
-            views.isEmpty() ? nullptr : views.data(), static_cast<uint32_t>(views.size()), nullptr,
-            reportProgress, state.get(), message, sizeof(message));
+        const QByteArray destBytes = dest.toUtf8();
+        char message[4096] = {};
+        ArchiverNestedOptions options = {};
+        options.max_depth = static_cast<uint32_t>(depth);
+        options.max_output_bytes = byteLimit;
+        options.keep_intermediate = keep;
+        options.all_branches = 1;
+        options.user = &ui;
+        options.password = [](const char *archive, int rejected, char *buffer, uint32_t capacity, void *user) {
+          return static_cast<UiCallbacks *>(user)->password(archive, rejected != 0, buffer, capacity);
+        };
+        options.password_accepted = [](const char *password, void *user) {
+          auto *ui = static_cast<UiCallbacks *>(user);
+          if (ui->save && ui->last && ui->last->bytes == password && !savePassword(ui->last->bytes)) ui->saveFailed = true;
+          ui->save = false;
+        };
+        if (askLayers) options.choose = [](const char *const *paths, uint32_t count, void *user) {
+          return static_cast<UiCallbacks *>(user)->choose(paths, count);
+        };
+        result.code = archiver_extract_nested_ex(pathBytes.constData(), nullptr, destBytes.constData(),
+            views.data(), static_cast<uint32_t>(views.size()), &options, reportProgress, state.get(), message, sizeof(message));
         result.detail = QString::fromUtf8(message);
-      } else {
-        result.code = archiver_extract_with_progress(
-            session->handle, destBytes.constData(),
-            secret ? secret->bytes.constData() : nullptr, reportProgress, state.get());
-        result.detail = QString::fromUtf8(archiver_message(session->handle));
+        result.passwordSaveFailed = ui.saveFailed;
       }
-    } catch (...) {
-      result.code = ARCHIVER_ERR_IO;
-    }
+    } catch (...) { result.code = ARCHIVER_ERR_IO; }
     wipeList(book);
     return result;
   }));

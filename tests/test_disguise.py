@@ -15,6 +15,7 @@ def run(cli, engine, args):
     proc = subprocess.run(
         [cli, *args, "--engine", engine],
         text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
     )

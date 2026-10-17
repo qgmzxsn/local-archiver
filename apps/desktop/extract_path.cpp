@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QFileInfo>
+#include <QRegularExpression>
 
 namespace {
 constexpr int kMaxComponent = 80;
@@ -12,6 +13,9 @@ bool endsWith(const QString &text, const QString &suffix) {
 }
 
 QString stripArchiveSuffix(QString name) {
+  // Remove a split-volume suffix before stripping the underlying format.
+  name.remove(QRegularExpression(QStringLiteral("[.](?:[0-9]{2,4}|[rz][0-9]{2})$"), QRegularExpression::CaseInsensitiveOption));
+  name.remove(QRegularExpression(QStringLiteral("[.]part[0-9]+(?=[.]rar$)"), QRegularExpression::CaseInsensitiveOption));
   const QStringList suffixes = {
       QStringLiteral(".tar.gz"), QStringLiteral(".tar.bz2"), QStringLiteral(".tar.xz"),
       QStringLiteral(".tar.zst"), QStringLiteral(".tbz2"), QStringLiteral(".tgz"),
@@ -20,7 +24,14 @@ QString stripArchiveSuffix(QString name) {
       QStringLiteral(".rar"), QStringLiteral(".mp4"), QStringLiteral(".m4v"),
       QStringLiteral(".mov"), QStringLiteral(".jpg"), QStringLiteral(".jpeg"),
       QStringLiteral(".png"), QStringLiteral(".gif"), QStringLiteral(".bmp"),
-      QStringLiteral(".webp")};
+      QStringLiteral(".webp"), QStringLiteral(".mkv"), QStringLiteral(".avi"),
+      QStringLiteral(".webm"), QStringLiteral(".gz"), QStringLiteral(".bz2"),
+      QStringLiteral(".xz"), QStringLiteral(".zst"), QStringLiteral(".zstd"),
+      QStringLiteral(".cab"), QStringLiteral(".iso"), QStringLiteral(".udf"),
+      QStringLiteral(".wim"), QStringLiteral(".swm"), QStringLiteral(".arj"),
+      QStringLiteral(".lzh"), QStringLiteral(".lha"), QStringLiteral(".cpio"),
+      QStringLiteral(".ar"), QStringLiteral(".deb"), QStringLiteral(".rpm"),
+      QStringLiteral(".dmg"), QStringLiteral(".xar")};
   bool stripped = true;
   while (stripped) {
     stripped = false;

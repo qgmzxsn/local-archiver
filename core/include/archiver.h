@@ -21,7 +21,7 @@ extern "C" {
 #  define ARCHIVER_API __attribute__((visibility("default")))
 #endif
 
-#define ARCHIVER_VERSION "0.3.0"
+#define ARCHIVER_VERSION "0.4.0"
 
 typedef enum ArchiverResult {
   ARCHIVER_OK = 0,
@@ -96,7 +96,7 @@ ARCHIVER_API ArchiverResult archiver_check_symlink(const char *link_path,
                                                     const char *target);
 
 /* Try passwords[0..count) in order. Header check only: the first password
-   that opens the archive (and decrypts the first encrypted item, for formats
+   that opens the archive (and decrypts a small encrypted item, for formats
    that do not fail at Open) is kept. *matched_index is that index, or -1
    when no password was needed. On failure the result is the same as
    archiver_open, including PASSWORD_REQUIRED when every password fails.
@@ -127,6 +127,30 @@ ARCHIVER_API ArchiverResult archiver_extract_nested(
     const char *const *passwords, uint32_t password_count, const char *chosen_inner,
     ArchiverProgressCallback progress, void *progress_user, char *message_buf,
     uint32_t message_cap);
+
+
+/* Callbacks run synchronously on the worker/calling thread. choose returns an
+   index, -1 to stop successfully, -2 to cancel, or -3 to unpack all branches.
+   password writes a NUL-terminated UTF-8 password and returns 1; 0 cancels.
+   Saved passwords are always tried before asking. No callback is retained. */
+typedef int (*ArchiverNestedChoose)(const char *const *paths, uint32_t count, void *user);
+typedef int (*ArchiverNestedPassword)(const char *path, int rejected, char *buffer,
+                                    uint32_t capacity, void *user);
+typedef struct ArchiverNestedOptions {
+  uint32_t max_depth;          /* 1..32; reaching this chosen depth is success */
+  uint64_t max_output_bytes;   /* cumulative across layers, 0 = 64 GiB */
+  int keep_intermediate;      /* original input is always kept */
+  int all_branches;           /* multiple archives get separate .unpacked folders */
+  ArchiverNestedChoose choose;
+  ArchiverNestedPassword password;
+  void (*password_accepted)(const char *password, void *user); /* verified; do not log */
+  void *user;
+} ArchiverNestedOptions;
+ARCHIVER_API ArchiverResult archiver_extract_nested_ex(
+    const char *archive_path, const char *engine_path, const char *dest_dir,
+    const char *const *passwords, uint32_t password_count,
+    const ArchiverNestedOptions *options, ArchiverProgressCallback progress,
+    void *progress_user, char *message_buf, uint32_t message_cap);
 
 #ifdef __cplusplus
 }

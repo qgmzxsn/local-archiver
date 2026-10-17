@@ -4,7 +4,10 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QInputDialog>
+#include <QDialog>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QSpinBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -78,10 +81,12 @@ class DesktopTests : public QObject {
     int prompts = 0;
     QTimer answer;
     connect(&answer, &QTimer::timeout, [&] {
-      if (auto *dialog = qobject_cast<QInputDialog *>(QApplication::activeModalWidget())) {
-        ++prompts;
-        dialog->setTextValue(password);
-        dialog->accept();
+      if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
+        if (auto *edit = dialog->findChild<QLineEdit *>("passwordEdit")) {
+          ++prompts;
+          edit->setText(password);
+          dialog->accept();
+        }
       }
     });
     answer.start(10);
@@ -142,7 +147,8 @@ class DesktopTests : public QObject {
     QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 1);
     QTimer reject;
     connect(&reject, &QTimer::timeout, [&] {
-      if (auto *dialog = qobject_cast<QInputDialog *>(QApplication::activeModalWidget())) dialog->reject();
+      if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget()))
+        if (dialog->findChild<QLineEdit *>("passwordEdit")) dialog->reject();
     });
     reject.start(10);
     window.openPath(encrypted);
@@ -150,9 +156,123 @@ class DesktopTests : public QObject {
     QCOMPARE(window.findChild<QTableView *>("archiveTable")->model()->rowCount(), 0);
     QVERIFY(!window.findChild<QPushButton *>("extractButton")->isEnabled());
   }
+  void nestedPasswordRetriesAtCurrentLayer() {
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString password = QUuid::createUuid().toString() + QStringLiteral("🔑");
+    const QString inner = temp.path() + "/inner.7z";
+    QVERIFY(makeArchive(temp.path(), inner, "inner secret", password));
+    QFile note(temp.path() + "/note.txt");
+    QVERIFY(note.open(QIODevice::WriteOnly)); note.write("outer note"); note.close();
+    const QString outer = temp.path() + "/outer.zip";
+    QProcess process;
+    process.setWorkingDirectory(temp.path());
+    process.start(sevenZip, {"a", "-tzip", outer, "inner.7z", "note.txt"});
+    QVERIFY(process.waitForFinished(15000)); QCOMPARE(process.exitCode(), 0);
+    MainWindow window;
+    window.openPath(outer);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    int prompts = 0;
+    QTimer answer;
+    connect(&answer, &QTimer::timeout, [&] {
+      auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+      if (!dialog) return;
+      if (auto *edit = dialog->findChild<QLineEdit *>("destinationEdit")) {
+        edit->setText(temp.path() + "/out");
+        dialog->findChild<QPushButton *>("extractOk")->click();
+      } else if (auto *edit = dialog->findChild<QLineEdit *>("passwordEdit")) {
+        edit->setText(++prompts == 1 ? "wrong" : password);
+        dialog->accept();
+      }
+    });
+    answer.start(10);
+    window.findChild<QPushButton *>("extractButton")->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 15000);
+    QCOMPARE(prompts, 2);
+    QFile output(temp.path() + "/out/hello.txt");
+    QVERIFY(output.open(QIODevice::ReadOnly)); QCOMPARE(output.readAll(), QByteArray("inner secret"));
+    QFile outerNote(temp.path() + "/out/note.txt");
+    QVERIFY(outerNote.open(QIODevice::ReadOnly)); QCOMPARE(outerNote.readAll(), QByteArray("outer note"));
+    QVERIFY(!QFile::exists(temp.path() + "/out/inner.7z"));
+  }
+  void nestedChoiceCanStopAfterOneLayer() {
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    QVERIFY(temp.isValid());
+    const QString inner = temp.path() + "/inner.zip";
+    QVERIFY(makeArchive(temp.path(), inner, "inner"));
+    const QString outer = temp.path() + "/outer.zip";
+    QProcess process;
+    process.setWorkingDirectory(temp.path());
+    process.start(sevenZip, {"a", "-tzip", outer, "inner.zip"});
+    QVERIFY(process.waitForFinished(15000)); QCOMPARE(process.exitCode(), 0);
+    MainWindow window;
+    window.openPath(outer);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    int choices = 0;
+    QTimer answer;
+    connect(&answer, &QTimer::timeout, [&] {
+      auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+      if (!dialog) return;
+      if (auto *edit = dialog->findChild<QLineEdit *>("destinationEdit")) {
+        edit->setText(temp.path() + "/out");
+        dialog->findChild<QComboBox *>("nestedModeCombo")->setCurrentIndex(1);
+        dialog->findChild<QPushButton *>("extractOk")->click();
+      } else if (auto *stop = dialog->findChild<QPushButton *>("stopNestedButton")) {
+        ++choices; stop->click();
+      }
+    });
+    answer.start(10);
+    window.findChild<QPushButton *>("extractButton")->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QCOMPARE(choices, 1);
+    QVERIFY(QFile::exists(temp.path() + "/out/inner.zip"));
+    QVERIFY(!QFile::exists(temp.path() + "/out/hello.txt"));
+    QVERIFY(window.findChild<QLabel *>("statusLabel")->text().contains(QStringLiteral("解压完成")));
+  }
+  void uiPreview() {
+    const QString outputDir = qEnvironmentVariable("ARCHIVER_UI_PREVIEW_DIR");
+    if (outputDir.isEmpty()) QSKIP("Set ARCHIVER_UI_PREVIEW_DIR to export actual Qt window previews");
+    QVERIFY(QDir().mkpath(outputDir));
+    QTemporaryDir temp(QDir::currentPath() + "/desktop-test-XXXXXX");
+    const QString archive = temp.path() + QStringLiteral("/项目资料.zip");
+    QStringList names{QStringLiteral("文档/使用说明.txt"), QStringLiteral("图片/封面.png"),
+        QStringLiteral("视频/演示.mp4"), QStringLiteral("素材包.7z"), QStringLiteral("README.txt"), QStringLiteral("文件清单.csv")};
+    for (const auto &name : names) {
+      QVERIFY(QDir().mkpath(QFileInfo(temp.path() + "/" + name).absolutePath()));
+      QFile file(temp.path() + "/" + name);
+      QVERIFY(file.open(QIODevice::WriteOnly)); file.write(QByteArray(2048, 'x'));
+    }
+    QProcess process;
+    process.setWorkingDirectory(temp.path());
+    QStringList args{"a", "-tzip", archive}; args.append(names);
+    process.start(sevenZip, args);
+    QVERIFY(process.waitForFinished(15000)); QCOMPARE(process.exitCode(), 0);
+    MainWindow window;
+    window.show(); window.openPath(archive);
+    QTRY_VERIFY_WITH_TIMEOUT(!window.isBusy(), 10000);
+    QTest::qWait(60);
+    QVERIFY(window.grab().save(outputDir + "/main-window.png"));
+    bool saved = false;
+    QTimer capture;
+    connect(&capture, &QTimer::timeout, [&] {
+      if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
+        if (dialog->findChild<QLineEdit *>("destinationEdit")) {
+          saved = dialog->grab().save(outputDir + "/extraction-options.png");
+          dialog->reject();
+        }
+      }
+    });
+    capture.start(50);
+    window.findChild<QPushButton *>("extractButton")->click();
+    QVERIFY(saved);
+  }
   void disguisedMp4WithLongTitleExtractsToLegalFolder() {
     const QString leaf = QStringLiteral("【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！ 【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！_1.mp4");
     QCOMPARE(sanitizeFolderComponent(leaf), QStringLiteral("【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！ 【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！_1"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.zip.001")), QStringLiteral("数据"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.part02.rar")), QStringLiteral("数据"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.iso")), QStringLiteral("数据"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.txt.gz")), QStringLiteral("数据.txt"));
     QCOMPARE(sanitizeFolderComponent(QStringLiteral("bad:name*.mp4")), QStringLiteral("bad_name_"));
     QCOMPARE(sanitizeFolderComponent(QStringLiteral("keep. .mp4")), QStringLiteral("keep"));
     QCOMPARE(sanitizeFolderComponent(QStringLiteral("CON.mp4")), QStringLiteral("解压文件"));

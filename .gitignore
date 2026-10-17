@@ -18,3 +18,5 @@ apps/android/local.properties
 apps/android/**/build/
 *.user
 __pycache__/
+
+build-ui/

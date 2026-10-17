@@ -35,7 +35,7 @@ class MainWindow : public QMainWindow {
   void testArchive();
   void showInfo();
   void showPasswordBook();
-  void startOpen(const QString &path, std::shared_ptr<DesktopSecret> secret = {});
+  void startOpen(const QString &path, std::shared_ptr<DesktopSecret> secret = {}, bool save = false);
   void startExtract(const QString &dest, bool nested, std::shared_ptr<DesktopSecret> secret = {});
   void setBusy(bool busy, bool extracting = false);
   void refreshProgress();
@@ -62,6 +62,10 @@ class MainWindow : public QMainWindow {
   QString directory_;
   QString archivePrefix_;
   QVector<struct ArchiveRow> archiveRows_;
+  int nestedDepth_ = 32;
+  int nestedByteLimitGiB_ = 64;
+  bool askLayers_ = false;
+  bool keepIntermediate_ = false;
   bool busy_ = false;
   bool extracting_ = false;
   bool closeAfterFinish_ = false;
