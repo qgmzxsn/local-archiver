@@ -1657,6 +1657,9 @@ uint32_t read_u32(const unsigned char *p) {
 uint16_t read_u16(const unsigned char *p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
+uint64_t read_u64(const unsigned char *p) {
+  return (uint64_t)read_u32(p) | ((uint64_t)read_u32(p + 4) << 32);
+}
 
 bool guid_for_kind(EngineLib &lib, Kind kind, const std::string &path, uint64_t offset, GUID &out,
                    std::string &message) {
@@ -1840,9 +1843,41 @@ void remember_hit(std::vector<SliceHit> &hits, Kind kind, uint64_t offset) {
   hits.push_back(SliceHit{kind, offset});
 }
 
+/* [ZIP64 end record][ZIP64 locator][classic EOCD]. The ZIP64 record ends
+   exactly where the locator starts. Its cd_size/cd_offset are relative to the
+   start of the ZIP, so the start is record_pos - cd_size - cd_offset. */
+bool zip64_start_from_locator(const std::string &path, uint64_t locator_pos, uint64_t *start) {
+  const uint64_t window = 1ull << 20;
+  uint64_t begin = locator_pos > window ? locator_pos - window : 0;
+  size_t len = static_cast<size_t>(locator_pos - begin);
+  if (len < 56) return false;
+  std::vector<unsigned char> buf(len);
+  size_t got = 0;
+  if (!read_at(path, begin, buf.data(), len, &got) || got < 56) return false;
+  for (size_t i = got - 4 + 1; i-- > 0;) {
+    if (!(buf[i] == 'P' && buf[i + 1] == 'K' && buf[i + 2] == 6 && buf[i + 3] == 6)) continue;
+    uint64_t record_size = read_u64(buf.data() + i + 4);
+    if (record_size < 44 || record_size > len) continue;
+    if (static_cast<uint64_t>(i) + 12 + record_size != len) continue;
+    uint64_t cd_size = read_u64(buf.data() + i + 40);
+    uint64_t cd_off = read_u64(buf.data() + i + 48);
+    uint64_t record_pos = begin + i;
+    if (record_pos < cd_size || record_pos - cd_size < cd_off) continue;
+    uint64_t origin = record_pos - cd_size - cd_off;
+    if (origin < locator_pos) {
+      *start = origin;
+      return true;
+    }
+  }
+  return false;
+}
+
 bool zip_start_from_eocd(const std::string &path, uint64_t file_size, uint64_t *start) {
   if (file_size < 22) return false;
-  uint64_t tail = file_size < (65535ull + 22ull) ? file_size : (65535ull + 22ull);
+  // The EOCD is normally at the end, but an archive glued into a media file may
+  // be followed by container data. Keep a larger search window for that case.
+  constexpr uint64_t kEocdWindow = 1ull << 20;
+  uint64_t tail = file_size < kEocdWindow ? file_size : kEocdWindow;
   std::vector<unsigned char> end(static_cast<size_t>(tail));
   size_t got = 0;
   if (!read_at(path, file_size - tail, end.data(), static_cast<size_t>(tail), &got) || got < 22) {
@@ -1852,13 +1887,31 @@ bool zip_start_from_eocd(const std::string &path, uint64_t file_size, uint64_t *
     if (end[i] == 'P' && end[i + 1] == 'K' && end[i + 2] == 5 && end[i + 3] == 6) {
       uint16_t comment = read_u16(end.data() + i + 20);
       uint64_t eocd = (file_size - got) + i;
-      if (eocd + 22ull + comment == file_size) {
-        uint32_t cd_size = read_u32(end.data() + i + 12);
-        uint32_t cd_off = read_u32(end.data() + i + 16);
-        int64_t origin = static_cast<int64_t>(eocd) - static_cast<int64_t>(cd_size) -
-                         static_cast<int64_t>(cd_off);
-        if (origin > 0 && static_cast<uint64_t>(origin) < file_size) {
-          *start = static_cast<uint64_t>(origin);
+      if (eocd + 22ull + comment <= file_size) {
+        uint64_t origin = 0;
+        bool have_origin = false;
+        if (eocd >= 20) {
+          unsigned char locator[20];
+          size_t locator_got = 0;
+          if (read_at(path, eocd - 20, locator, 20, &locator_got) && locator_got == 20 &&
+              locator[0] == 'P' && locator[1] == 'K' && locator[2] == 6 && locator[3] == 7) {
+            have_origin = zip64_start_from_locator(path, eocd - 20, &origin);
+          }
+        }
+        if (!have_origin) {
+          uint32_t cd_size = read_u32(end.data() + i + 12);
+          uint32_t cd_off = read_u32(end.data() + i + 16);
+          if (cd_size != 0xFFFFFFFFu && cd_off != 0xFFFFFFFFu) {
+            int64_t classic = static_cast<int64_t>(eocd) - static_cast<int64_t>(cd_size) -
+                              static_cast<int64_t>(cd_off);
+            if (classic >= 0) {
+              origin = static_cast<uint64_t>(classic);
+              have_origin = true;
+            }
+          }
+        }
+        if (have_origin && origin < file_size) {
+          *start = origin;
           return true;
         }
       }

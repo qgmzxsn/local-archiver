@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """MP4/image disguise: renamed archives and archives glued after media. No rar writer is committed."""
 
+import io
 import os
 import struct
 import subprocess
@@ -108,6 +109,49 @@ def main():
             errors += fail("zip after jpeg end")
         else:
             print("ok zip after jpeg end")
+
+        # ZIP64 needs the ZIP64 end record to locate the start when the archive
+        # is prefixed or followed by media data.
+        def zip64_bytes(data):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as zf:
+                zf.writestr("dir/hello.txt", data)
+            raw = bytearray(buffer.getvalue())
+            eocd = raw.rfind(b"PK\x05\x06")
+            cd_size, cd_offset = struct.unpack_from("<II", raw, eocd + 12)
+            zip64_end = struct.pack("<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, 1, 1,
+                                    cd_size, cd_offset)
+            locator = struct.pack("<IIQI", 0x07064B50, 0, eocd, 1)
+            classic = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0xFFFF, 0xFFFF,
+                                  0xFFFFFFFF, 0xFFFFFFFF, 0)
+            return bytes(raw[:eocd]) + zip64_end + locator + classic
+
+        prefix = mp4_bytes(b"\x00" * (256 * 1024))
+        suffix = b"MOOVTRAILER" * 1000
+        containers = {
+            "zip64.mp4": zip64_bytes(payload),
+            "zip64-prefixed.mp4": prefix + zip64_bytes(payload),
+            "zip64-trailing.mp4": prefix + zip64_bytes(payload) + suffix,
+            "zip-prefixed.mp4": prefix + zip_bytes,
+            "zip-trailing.mp4": prefix + zip_bytes + suffix,
+        }
+        for name, content in containers.items():
+            path = os.path.join(tmp, name)
+            open(path, "wb").write(content)
+            code, out, err = run(cli, engine, ["list", path])
+            if code != 0 or "dir/hello.txt" not in out:
+                print(code, out, err, file=sys.stderr)
+                errors += fail(name + " list")
+                continue
+            dest = os.path.join(tmp, "out-" + name)
+            os.makedirs(dest)
+            code, out, err = run(cli, engine, ["extract", path, dest])
+            got = os.path.join(dest, "dir", "hello.txt")
+            if code != 0 or not os.path.isfile(got) or open(got, "rb").read() != payload:
+                print(code, out, err, file=sys.stderr)
+                errors += fail(name + " extract")
+            else:
+                print("ok", name)
 
         seven = None
         try:

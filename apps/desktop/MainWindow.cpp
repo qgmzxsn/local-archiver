@@ -25,8 +25,10 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFutureWatcher>
+#include <QHash>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -37,6 +39,7 @@
 #include <QMimeData>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSet>
 #include <QStatusBar>
 #include <QTableView>
 #include <QTimer>
@@ -83,7 +86,13 @@ struct ArchiveRow {
 
 class ArchiveModel final : public QAbstractTableModel {
  public:
-  explicit ArchiveModel(QObject *parent) : QAbstractTableModel(parent) {}
+  explicit ArchiveModel(QObject *parent) : QAbstractTableModel(parent) {
+    // data() runs for every visible cell on every repaint. Keep the
+    // style lookups and locale out of that path.
+    fileIcon_ = QApplication::style()->standardIcon(QStyle::SP_FileIcon);
+    dirIcon_ = QApplication::style()->standardIcon(QStyle::SP_DirIcon);
+    upIcon_ = QApplication::style()->standardIcon(QStyle::SP_ArrowUp);
+  }
   int rowCount(const QModelIndex &parent = {}) const override {
     return parent.isValid() ? 0 : static_cast<int>(rows_.size());
   }
@@ -106,20 +115,24 @@ class ArchiveModel final : public QAbstractTableModel {
       return static_cast<int>(Qt::AlignRight | Qt::AlignVCenter);
     if (role == Qt::ToolTipRole) return row.path;
     if (role == Qt::DecorationRole && index.column() == 0)
-      return QApplication::style()->standardIcon(row.parent ? QStyle::SP_ArrowUp :
-          row.directory ? QStyle::SP_DirIcon : QStyle::SP_FileIcon);
+      return row.parent ? upIcon_ : row.directory ? dirIcon_ : fileIcon_;
     if (role != Qt::DisplayRole) return {};
     if (index.column() == 0) return row.name;
     if (index.column() == 1) {
       if (row.parent || row.directory) return {};
-      return QLocale().formattedDataSize(row.size);
+      return locale_.formattedDataSize(row.size);
     }
     if (index.column() == 2) {
       if (!row.hasPacked) return {};
-      return QLocale().formattedDataSize(row.packed);
+      return locale_.formattedDataSize(row.packed);
     }
     if (row.modified < 0) return {};
-    return QLocale().toString(QDateTime::fromSecsSinceEpoch(row.modified), QLocale::ShortFormat);
+    const auto cached = modifiedText_.constFind(row.modified);
+    if (cached != modifiedText_.constEnd()) return cached.value();
+    const QString text =
+        locale_.toString(QDateTime::fromSecsSinceEpoch(row.modified), QLocale::ShortFormat);
+    modifiedText_.insert(row.modified, text);
+    return text;
   }
   const ArchiveRow *rowAt(int row) const {
     if (row < 0 || row >= rows_.size()) return nullptr;
@@ -127,6 +140,7 @@ class ArchiveModel final : public QAbstractTableModel {
   }
   void setRows(QVector<ArchiveRow> rows) {
     beginResetModel();
+    modifiedText_.clear();
     rows_ = std::move(rows);
     sortRows();
     endResetModel();
@@ -145,6 +159,11 @@ class ArchiveModel final : public QAbstractTableModel {
     return total;
   }
  private:
+  QIcon fileIcon_;
+  QIcon dirIcon_;
+  QIcon upIcon_;
+  QLocale locale_;
+  mutable QHash<qint64, QString> modifiedText_;
   int sortColumn_ = 0;
   Qt::SortOrder sortOrder_ = Qt::AscendingOrder;
   void sortRows() {
@@ -250,7 +269,7 @@ int reportProgress(uint64_t completed, uint64_t total, void *user) {
 
 bool looksLikeArchive(const QString &name) {
   const QString lower = name.toLower();
-  const QStringList suffixes = {
+  static const QStringList suffixes = {
       QStringLiteral(".zip"), QStringLiteral(".7z"), QStringLiteral(".tar"),
       QStringLiteral(".tgz"), QStringLiteral(".tar.gz"), QStringLiteral(".tbz"),
       QStringLiteral(".tbz2"), QStringLiteral(".tar.bz2"), QStringLiteral(".txz"),
@@ -436,6 +455,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   table_->setSelectionBehavior(QAbstractItemView::SelectRows);
   table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
   table_->setShowGrid(false);
+  table_->setWordWrap(false);
+  table_->setTextElideMode(Qt::ElideRight);
   table_->setAlternatingRowColors(true);
   table_->setSortingEnabled(true);
   table_->sortByColumn(0, Qt::AscendingOrder);
@@ -626,30 +647,33 @@ void MainWindow::fillArchiveRows(const QVector<ArchiveRow> &rows) {
     parent.directory = true;
     view.push_back(parent);
   }
-  QStringList folders;
+  // A ZIP may list a directory explicitly and also list files below it.
+  // Both paths must produce exactly one row for that directory.
+  QSet<QString> folders;
   for (const ArchiveRow &row : rows) {
     if (!row.path.startsWith(archivePrefix_)) continue;
-    QString rest = row.path.mid(archivePrefix_.size());
+    const QString rest = row.path.mid(archivePrefix_.size());
     if (rest.isEmpty()) continue;
     const int slash = rest.indexOf(QLatin1Char('/'));
     if (slash >= 0) {
       const QString folder = rest.left(slash);
-      if (!folders.contains(folder)) {
-        folders.push_back(folder);
-        ArchiveRow dir;
-        dir.name = folder;
-        dir.path = archivePrefix_ + folder + QLatin1Char('/');
-        dir.directory = true;
-        view.push_back(dir);
-      }
-    } else if (!row.directory) {
-      ArchiveRow file = row;
-      file.name = rest;
-      view.push_back(file);
-    } else {
+      if (folders.contains(folder)) continue;
+      folders.insert(folder);
+      ArchiveRow dir;
+      dir.name = folder;
+      dir.path = archivePrefix_ + folder + QLatin1Char('/');
+      dir.directory = true;
+      view.push_back(dir);
+    } else if (row.directory) {
+      if (folders.contains(rest)) continue;
+      folders.insert(rest);
       ArchiveRow dir = row;
       dir.name = rest;
       view.push_back(dir);
+    } else {
+      ArchiveRow file = row;
+      file.name = rest;
+      view.push_back(file);
     }
   }
   model_->setRows(view);
