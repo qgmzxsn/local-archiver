@@ -2,6 +2,7 @@
 #include "utf.hpp"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <iostream>
@@ -134,7 +135,7 @@ void usage() {
       << "  archiver-cli extract <压缩包> <目标文件夹> [--engine 7z.so]\n"
       << "  archiver-cli test <压缩包> [--engine 7z.so]\n"
       << "  archiver-cli try-passwords <压缩包> <密码文件> [--engine 7z.so]\n"
-      << "  archiver-cli nested <压缩包> <目标文件夹> [密码文件] [--engine 7z.so]\n"
+      << "  archiver-cli nested <压缩包> <目标文件夹> [密码文件] [--all] [--depth 1..32] [--keep] [--engine 7z.so]\n"
       << "  archiver-cli create-zip <压缩包> <文件>... [--engine 7z.so]\n"
       << "需要密码时从键盘输入。密码不会写入文件，也不会出现在命令行参数里。\n"
       << "try-passwords 只按文件里的顺序做头部校验，不会询问，也不会打印密码。\n"
@@ -220,11 +221,27 @@ int cmd_nested(int argc, char **argv) {
   }
   const char *password_file = nullptr;
   const char *engine = nullptr;
+  bool extended = false;
+  ArchiverNestedOptions options = {};
+  options.max_depth = 32;
+  options.all_branches = 1;
   for (int i = 4; i < argc; ++i) {
     if (strcmp(argv[i], "--engine") == 0) {
       if (i + 1 >= argc) return ARCHIVER_ERR_ARGUMENT;
       engine = argv[++i];
-    } else if (!password_file) {
+    } else if (strcmp(argv[i], "--all") == 0) {
+      extended = true;
+    } else if (strcmp(argv[i], "--keep") == 0) {
+      extended = true;
+      options.keep_intermediate = 1;
+    } else if (strcmp(argv[i], "--depth") == 0) {
+      if (++i >= argc) return ARCHIVER_ERR_ARGUMENT;
+      char *end = nullptr;
+      long depth = strtol(argv[i], &end, 10);
+      if (!end || *end || depth < 1 || depth > 32) return ARCHIVER_ERR_ARGUMENT;
+      options.max_depth = static_cast<uint32_t>(depth);
+      extended = true;
+    } else if (!password_file && argv[i][0] != '-') {
       password_file = argv[i];
     } else {
       usage();
@@ -237,8 +254,10 @@ int cmd_nested(int argc, char **argv) {
   for (std::string &password : passwords) views.push_back(password.c_str());
   char message[1024];
   message[0] = 0;
-  ArchiverResult result = archiver_extract_nested(
+  ArchiverResult result = extended ? archiver_extract_nested_ex(
       argv[2], engine, argv[3], views.empty() ? nullptr : views.data(),
+      static_cast<uint32_t>(views.size()), &options, nullptr, nullptr, message, sizeof(message)) :
+      archiver_extract_nested(argv[2], engine, argv[3], views.empty() ? nullptr : views.data(),
       static_cast<uint32_t>(views.size()), nullptr, nullptr, nullptr, message, sizeof(message));
   print_result(result, nullptr);
   if (message[0]) std::cout << message << "\n";

@@ -7,6 +7,8 @@
 /* Windows Credential Manager only. Other platforms keep an empty book. */
 class PasswordBook {
  public:
+  static constexpr int maxPasswords = 64;
+  static constexpr int maxPasswordBytes = 1024;
   static bool available();
   static QVector<QByteArray> load();
   static bool store(const QVector<QByteArray> &passwords);

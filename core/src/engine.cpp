@@ -210,6 +210,7 @@ enum class Kind {
   TarXz,
   TarZst,
   Rar,
+  Gzip, Bzip2, Xz, Zstd, Cab, Iso, Udf, Wim, Arj, Lzh, Cpio, Ar, Rpm, Dmg, Xar,
   Split,
   Unsupported
 };
@@ -285,6 +286,14 @@ Kind classify(const std::string &path) {
   if (ends_with(base, ".7z")) return Kind::SevenZ;
   if (ends_with(base, ".zip")) return Kind::Zip;
   if (ends_with(base, ".rar")) return Kind::Rar;
+  const std::pair<const char *, Kind> extra[] = {
+      {".gz", Kind::Gzip}, {".bz2", Kind::Bzip2}, {".xz", Kind::Xz},
+      {".zst", Kind::Zstd}, {".zstd", Kind::Zstd}, {".cab", Kind::Cab},
+      {".iso", Kind::Iso}, {".udf", Kind::Udf}, {".wim", Kind::Wim},
+      {".swm", Kind::Wim}, {".arj", Kind::Arj}, {".lzh", Kind::Lzh},
+      {".lha", Kind::Lzh}, {".cpio", Kind::Cpio}, {".ar", Kind::Ar},
+      {".deb", Kind::Ar}, {".rpm", Kind::Rpm}, {".dmg", Kind::Dmg}, {".xar", Kind::Xar}};
+  for (const auto &item : extra) if (ends_with(base, item.first)) return item.second;
   return Kind::Unsupported;
 }
 
@@ -294,7 +303,8 @@ bool is_disguise_carrier(const std::string &path) {
   std::string base = basename_lower(path);
   return ends_with(base, ".mp4") || ends_with(base, ".m4v") || ends_with(base, ".mov") ||
          ends_with(base, ".jpg") || ends_with(base, ".jpeg") || ends_with(base, ".png") ||
-         ends_with(base, ".gif") || ends_with(base, ".bmp") || ends_with(base, ".webp");
+         ends_with(base, ".gif") || ends_with(base, ".bmp") || ends_with(base, ".webp") ||
+         ends_with(base, ".avi") || ends_with(base, ".mkv") || ends_with(base, ".webm");
 }
 
 using CreateObjectFn = HRESULT(STDAPICALLTYPE *)(const GUID *, const GUID *, void **);
@@ -353,6 +363,7 @@ struct ArchiverArchive {
   std::string temp_dir;
   std::string source_path;
   VolumeContext volumes;
+  std::string fallback_name;
 
   ~ArchiverArchive() {
     archive.Release();
@@ -594,6 +605,7 @@ struct ExtractCtx {
   PasswordState *password = nullptr;
   archiver::SafeDest *dest = nullptr;
   std::string *message = nullptr;
+  std::string fallback_name;
   bool path_failed = false;
   bool io_failed = false;
   bool unsupported = false;
@@ -631,7 +643,7 @@ Z7_COM7F_IMF(FileOutStream::Write(const void *data, UInt32 size, UInt32 *process
   if (processedSize) *processedSize = 0;
   if (!file || !ctx) return E_FAIL;
   if (!ctx->report_progress()) return E_ABORT;
-  if (size > kWriteCap || ctx->written > kWriteCap - size) {
+  if (ctx->written > kWriteCap - size) {
     ctx->io_failed = true;
     if (ctx->message) *ctx->message = "output is larger than this build will write";
     return E_ABORT;
@@ -765,6 +777,7 @@ Z7_COM7F_IMF(ExtractCallback::GetStream(UInt32 index, ISequentialOutStream **out
   std::string path;
   bool embedded = false;
   if (read_string_prop(archive, index, kpidPath, path, embedded) != S_OK) return E_FAIL;
+  if (path.empty()) path = ctx->fallback_name;
   if (path.empty()) return S_OK;
   if (embedded) {
     ctx->path_failed = true;
@@ -1306,7 +1319,7 @@ ArchiverResult open_on_stream(EngineLib &lib, const GUID &clsid, IInStream *in, 
 }
 
 ArchiverResult read_entries(IInArchive *archive, std::vector<ListedEntry> &entries,
-                            std::string &message) {
+                            std::string &message, const std::string &fallback = {}) {
   UInt32 count = 0;
   if (archive->GetNumberOfItems(&count) != S_OK) {
     message = "could not list archive";
@@ -1324,6 +1337,7 @@ ArchiverResult read_entries(IInArchive *archive, std::vector<ListedEntry> &entri
       message = "could not read entry name";
       return ARCHIVER_ERR_FORMAT;
     }
+    if (path.empty()) path = fallback;
     if (path.empty()) continue;
     if (embedded) {
       message = "refused path: control-character";
@@ -1398,7 +1412,21 @@ const char *outer_name(Kind kind) {
     case Kind::TarGz: return "gzip";
     case Kind::TarBz2: return "bzip2";
     case Kind::TarXz: return "xz";
-    case Kind::TarZst: return "zstd";
+    case Kind::TarZst: case Kind::Zstd: return "zstd";
+    case Kind::Gzip: return "gzip";
+    case Kind::Bzip2: return "bzip2";
+    case Kind::Xz: return "xz";
+    case Kind::Cab: return "Cab";
+    case Kind::Iso: return "Iso";
+    case Kind::Udf: return "Udf";
+    case Kind::Wim: return "Wim";
+    case Kind::Arj: return "Arj";
+    case Kind::Lzh: return "Lzh";
+    case Kind::Cpio: return "Cpio";
+    case Kind::Ar: return "Ar";
+    case Kind::Rpm: return "Rpm";
+    case Kind::Dmg: return "Dmg";
+    case Kind::Xar: return "Xar";
     default: return "";
   }
 }
@@ -1418,7 +1446,7 @@ bool handler_for(EngineLib &lib, Kind kind, const std::string &path, GUID &out, 
     message = "7-Zip library has no RAR handler";
     return false;
   }
-  if (kind == Kind::TarZst) {
+  if (kind == Kind::TarZst || kind == Kind::Zstd) {
     if (find_handler(lib, "zstd", out) || find_handler(lib, "zstd2", out)) return true;
     message = "7-Zip library has no zstd handler";
     return false;
@@ -1442,7 +1470,7 @@ class BorrowedFileOut Z7_final : public ISequentialOutStream, public CMyUnknownI
 Z7_COM7F_IMF(BorrowedFileOut::Write(const void *data, UInt32 size, UInt32 *processedSize)) {
   if (processedSize) *processedSize = 0;
   if (!file) return E_FAIL;
-  if (size > kWriteCap || written > kWriteCap - size) {
+  if (written > kWriteCap - size) {
     if (failed) *failed = true;
     return E_ABORT;
   }
@@ -1913,11 +1941,41 @@ ArchiverResult open_disguised(ArchiverArchive *archive, const std::string &path,
   return ARCHIVER_ERR_UNSUPPORTED;
 }
 
-ArchiverResult archiver_open(const char *archive_path, const char *engine_path, const char *password,
+std::string leading_volume(const std::string &path) {
+  std::string base = basename_lower(path);
+  size_t dot = base.rfind('.');
+  if (dot == std::string::npos) return path;
+  std::string ext = base.substr(dot + 1);
+  if (ext.size() >= 2 && ext.size() <= 4 && all_digits(ext))
+    return path.substr(0, path.size() - ext.size()) + std::string(ext.size() - 1, '0') + "1";
+  if (ext.size() == 3 && all_digits(ext.substr(1))) {
+    if (ext[0] == 'r') return path.substr(0, path.size() - 3) + "rar";
+    if (ext[0] == 'z') return path.substr(0, path.size() - 3) + "zip";
+  }
+  size_t part = base.rfind(".part");
+  if (part != std::string::npos && ends_with(base, ".rar")) {
+    std::string number = base.substr(part + 5, base.size() - part - 9);
+    if (all_digits(number)) {
+      size_t start = path.size() - base.size() + part + 5;
+      return path.substr(0, start) + std::string(number.size() - 1, '0') + "1" + path.substr(start + number.size());
+    }
+  }
+  return path;
+}
+
+ArchiverResult archiver_open(const char *input_path, const char *engine_path, const char *password,
                              ArchiverArchive **out) {
   if (!out) return ARCHIVER_ERR_ARGUMENT;
   *out = nullptr;
-  if (!archive_path || !archive_path[0]) return ARCHIVER_ERR_ARGUMENT;
+  if (!input_path || !input_path[0]) return ARCHIVER_ERR_ARGUMENT;
+  const std::string normalized = leading_volume(input_path);
+  const char *archive_path = normalized.c_str();
+  if (normalized != input_path && !regular_file_exists(normalized)) {
+    auto *failed = new ArchiverArchive();
+    failed->message = "missing volume: " + base_name_of(normalized);
+    *out = failed;
+    return ARCHIVER_ERR_MISSING_VOLUME;
+  }
 
   Kind kind = classify(archive_path);
   bool disguise = false;
@@ -1928,6 +1986,14 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
 
   std::unique_ptr<ArchiverArchive> archive(new ArchiverArchive());
   archive->source_path = archive_path;
+  if (kind == Kind::Gzip || kind == Kind::Bzip2 || kind == Kind::Xz || kind == Kind::Zstd) {
+    std::string name = archive_path;
+    size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) name.erase(0, slash + 1);
+    size_t dot = name.rfind('.');
+    if (dot != std::string::npos) name.resize(dot);
+    archive->fallback_name = name.empty() ? "content" : name;
+  }
   fill_volume_context(archive->volumes, archive_path);
   PasswordState pw = password_from(password);
   if (!load_engine(archive->engine, engine_path, archive->message)) {
@@ -1979,7 +2045,7 @@ ArchiverResult archiver_open(const char *archive_path, const char *engine_path, 
   }
 
   if (result == ARCHIVER_OK && archive->entries.empty()) {
-    result = read_entries(archive->archive, archive->entries, archive->message);
+    result = read_entries(archive->archive, archive->entries, archive->message, archive->fallback_name);
     if (result != ARCHIVER_OK) {
       if (archive->archive) archive->archive->Close();
       archive->archive.Release();
@@ -2046,6 +2112,7 @@ ArchiverResult archiver_extract_with_progress(
   ExtractCtx ctx;
   ctx.password = &pw;
   ctx.dest = dest.get();
+  ctx.fallback_name = archive->fallback_name;
   ctx.message = &archive->message;
   ctx.progress = progress;
   ctx.progress_user = user;
@@ -2407,7 +2474,8 @@ struct NestedBudget {
   int depth = 0;
   uint64_t bytes = 0;
   uint32_t files = 0;
-  std::vector<std::string> skip;
+  std::vector<std::string> secrets;
+  ~NestedBudget() { for (auto &secret : secrets) wipe_string(secret); }
 };
 
 bool delete_file_at(const std::string &path) {
@@ -2419,173 +2487,180 @@ bool delete_file_at(const std::string &path) {
 #endif
 }
 
-bool walk_regular_files(const std::string &root, const std::string &rel, std::vector<std::string> &out) {
-  std::string full = rel.empty() ? root : join_dir(root, rel);
-#if defined(_WIN32)
-  std::wstring pattern = utf8_to_wide((full + "\\*").c_str());
-  WIN32_FIND_DATAW data;
-  HANDLE handle = ::FindFirstFileW(pattern.c_str(), &data);
-  if (handle == INVALID_HANDLE_VALUE) return false;
-  do {
-    if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) continue;
-    if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-    std::string name = wide_to_utf8(data.cFileName, wcslen(data.cFileName));
-    std::string child = rel.empty() ? name : rel + "/" + name;
-    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      if (!walk_regular_files(root, child, out)) {
-        ::FindClose(handle);
-        return false;
-      }
-    } else {
-      out.push_back(child);
-    }
-  } while (::FindNextFileW(handle, &data));
-  ::FindClose(handle);
-  return true;
-#else
-  DIR *dir = ::opendir(full.c_str());
-  if (!dir) return false;
-  while (dirent *ent = ::readdir(dir)) {
-    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-    std::string name = ent->d_name;
-    std::string child = rel.empty() ? name : rel + "/" + name;
-    std::string child_full = join_dir(full, name);
-    struct stat st;
-    if (::lstat(child_full.c_str(), &st) != 0) continue;
-    if (S_ISLNK(st.st_mode)) continue;
-    if (S_ISDIR(st.st_mode)) {
-      if (!walk_regular_files(root, child, out)) {
-        ::closedir(dir);
-        return false;
-      }
-    } else if (S_ISREG(st.st_mode)) {
-      out.push_back(child);
-    }
+// Non-leading volumes are supplied to the handler by the first volume.
+bool continuation_volume(const std::string &path) {
+  std::string base = basename_lower(path);
+  size_t dot = base.rfind('.');
+  std::string ext = dot == std::string::npos ? "" : base.substr(dot + 1);
+  if (all_digits(ext) && ext.size() >= 2 && ext.size() <= 4)
+    return strtoul(ext.c_str(), nullptr, 10) != 1;
+  if (ext.size() == 3 && (ext[0] == 'r' || ext[0] == 'z') && all_digits(ext.substr(1)))
+    return true;
+  size_t part = base.rfind(".part");
+  if (part != std::string::npos && ends_with(base, ".rar")) {
+    std::string number = base.substr(part + 5, base.size() - part - 9);
+    if (all_digits(number)) return strtoul(number.c_str(), nullptr, 10) != 1;
   }
-  ::closedir(dir);
-  return true;
-#endif
+  return false;
+}
+
+struct NestedProgress {
+  ArchiverProgressCallback callback;
+  void *user;
+  uint64_t used;
+  uint64_t limit;
+  bool exceeded = false;
+  uint64_t written = 0;
+};
+int nested_progress(uint64_t completed, uint64_t total, void *user) {
+  auto *p = static_cast<NestedProgress *>(user);
+  p->written = std::max(p->written, completed);
+  if (completed > p->limit - p->used) { p->exceeded = true; return 1; }
+  return p->callback ? p->callback(completed, total, p->user) : 0;
 }
 
 ArchiverResult nested_extract(const std::string &path, const char *engine, const std::string &dest,
                               const char *const *passwords, uint32_t password_count,
                               const char *chosen, NestedBudget &budget, ArchiverProgressCallback progress,
-                              void *progress_user, std::string &message) {
-  if (budget.depth >= kNestedDepthLimit) {
+                              void *progress_user, std::string &message,
+                              const ArchiverNestedOptions *options = nullptr) {
+  const uint32_t depth_limit = options ? options->max_depth : kNestedDepthLimit;
+  const uint64_t byte_limit = options ? (options->max_output_bytes ? options->max_output_bytes : kWriteCap)
+                                     : kNestedByteLimit;
+  if (static_cast<uint32_t>(budget.depth) >= depth_limit) {
     message = "nested depth limit";
     return ARCHIVER_ERR_LIMIT;
   }
-  budget.skip.push_back(path);
+  if (progress && progress(0, 0, progress_user)) return ARCHIVER_ERR_CANCELLED;
   int32_t matched = -1;
   ArchiverArchive *archive = nullptr;
-  ArchiverResult opened =
-      archiver_open_with_passwords(path.c_str(), engine, passwords, password_count, &matched, &archive);
-  if (opened != ARCHIVER_OK) {
-    if (archive && !archive->message.empty()) message = archive->message;
-    else if (opened == ARCHIVER_ERR_PASSWORD_REQUIRED) message = "password required";
-    else if (opened == ARCHIVER_ERR_PASSWORD) message = "password rejected";
+  std::vector<const char *> candidates;
+  for (uint32_t i = 0; passwords && i < password_count; ++i) candidates.push_back(passwords[i]);
+  for (const auto &item : budget.secrets) candidates.push_back(item.c_str());
+  ArchiverResult opened = archiver_open_with_passwords(
+      path.c_str(), engine, candidates.data(), static_cast<uint32_t>(candidates.size()), &matched, &archive);
+  std::string entered;
+  bool rejected = false;
+  while ((opened == ARCHIVER_ERR_PASSWORD_REQUIRED || opened == ARCHIVER_ERR_PASSWORD) &&
+         options && options->password) {
     archiver_close(archive);
+    archive = nullptr;
+    char buffer[4096] = {};
+    if (!options->password(path.c_str(), rejected, buffer, sizeof(buffer), options->user)) {
+      wipe_bytes(buffer, sizeof(buffer));
+      wipe_string(entered);
+      return ARCHIVER_ERR_CANCELLED;
+    }
+    buffer[sizeof(buffer) - 1] = 0;
+    wipe_string(entered);
+    entered = buffer;
+    wipe_bytes(buffer, sizeof(buffer));
+    const char *view = entered.c_str();
+    opened = archiver_open_with_passwords(path.c_str(), engine, &view, 1, &matched, &archive);
+    rejected = true;
+  }
+  // Own every handle on every exit, including cancellation and limits.
+  std::unique_ptr<ArchiverArchive> held(archive);
+  if (opened != ARCHIVER_OK) {
+    message = archive && !archive->message.empty() ? archive->message : archiver_result_string(opened);
+    wipe_string(entered);
     return opened;
   }
+  std::vector<ListedEntry> entries = archive->entries;
   uint64_t declared = 0;
-  uint32_t count = static_cast<uint32_t>(archive->entries.size());
-  for (const ListedEntry &entry : archive->entries) {
-    if (declared > kNestedByteLimit - entry.size) {
-      message = "output byte limit";
-      archiver_close(archive);
-      return ARCHIVER_ERR_LIMIT;
+  uint32_t count = static_cast<uint32_t>(entries.size());
+  for (const ListedEntry &entry : entries) {
+    if (entry.size > byte_limit || declared > byte_limit - entry.size) {
+      message = "output byte limit"; wipe_string(entered); return ARCHIVER_ERR_LIMIT;
     }
     declared += entry.size;
   }
-  if (budget.files > kNestedFileLimit - count) {
-    message = "file count limit";
-    archiver_close(archive);
-    return ARCHIVER_ERR_LIMIT;
+  if (count > kNestedFileLimit || budget.files > kNestedFileLimit - count) {
+    message = "file count limit"; wipe_string(entered); return ARCHIVER_ERR_LIMIT;
   }
-  if (budget.bytes > kNestedByteLimit - declared) {
-    message = "output byte limit";
-    archiver_close(archive);
-    return ARCHIVER_ERR_LIMIT;
+  if (budget.bytes > byte_limit - declared) {
+    message = "output byte limit"; wipe_string(entered); return ARCHIVER_ERR_LIMIT;
   }
   uint64_t packed = 0;
-  if (!archive->source_path.empty()) file_size_of(archive->source_path, &packed);
+  file_size_of(archive->source_path, &packed);
   if (declared >= kNestedRatioFloor && packed > 0 && declared / packed > kNestedRatioLimit) {
-    message = "compression ratio limit";
-    archiver_close(archive);
-    return ARCHIVER_ERR_LIMIT;
+    message = "compression ratio limit"; wipe_string(entered); return ARCHIVER_ERR_LIMIT;
   }
-  const char *password = nullptr;
-  std::string password_copy;
-  if (matched >= 0 && passwords && static_cast<uint32_t>(matched) < password_count &&
-      passwords[matched]) {
-    password_copy = passwords[matched];
-    password = password_copy.c_str();
+  const char *password = rejected ? entered.c_str() :
+      (matched >= 0 && static_cast<size_t>(matched) < candidates.size() ? candidates[matched] : nullptr);
+  NestedProgress reporting{progress, progress_user, budget.bytes, byte_limit};
+  ArchiverResult extracted = archiver_extract_with_progress(
+      archive, dest.c_str(), password, nested_progress, &reporting);
+  if (extracted == ARCHIVER_OK && rejected) {
+    budget.secrets.push_back(entered);
+    if (options->password_accepted) options->password_accepted(entered.c_str(), options->user);
   }
-  ArchiverResult extracted =
-      archiver_extract_with_progress(archive, dest.c_str(), password, progress, progress_user);
+  wipe_string(entered);
   if (extracted != ARCHIVER_OK) {
-    if (!archive->message.empty()) message = archive->message;
-    archiver_close(archive);
-    wipe_string(password_copy);
-    return extracted;
+    message = reporting.exceeded ? "output byte limit" : archive->message;
+    return reporting.exceeded ? ARCHIVER_ERR_LIMIT : extracted;
   }
-  archiver_close(archive);
-  wipe_string(password_copy);
-  budget.bytes += declared;
+  held.reset();
+  budget.bytes += std::max(declared, reporting.written);
   budget.files += count;
-  budget.depth += 1;
+  ++budget.depth;
+  struct DepthGuard { int &depth; ~DepthGuard() { --depth; } } guard{budget.depth};
+  if (options && static_cast<uint32_t>(budget.depth) >= depth_limit) return ARCHIVER_OK;
 
-  std::vector<std::string> files;
-  if (!walk_regular_files(dest, std::string(), files)) {
-    message = "could not read extracted files";
-    return ARCHIVER_ERR_IO;
-  }
   std::vector<std::string> archives;
-  for (const std::string &rel : files) {
-    if (rel.find("..") != std::string::npos) continue;
-    std::string full = join_dir(dest, rel);
-    bool skipped = false;
-    for (const std::string &prior : budget.skip) {
-      if (prior == full) skipped = true;
-    }
-    if (skipped) continue;
+  // Inspect only this layer's extracted entries. Never unpack unrelated files
+  // already present in the destination or traverse extracted symbolic links.
+  for (const auto &entry : entries) {
+    const std::string &rel = entry.path;
+    if (entry.is_dir || entry.is_symlink || continuation_volume(rel)) continue;
+    if (classify(rel) == Kind::Unsupported && !is_disguise_carrier(rel)) continue;
+    if (progress && progress(0, 0, progress_user)) return ARCHIVER_ERR_CANCELLED;
     ArchiverArchive *inner = nullptr;
-    ArchiverResult trial = archiver_open(full.c_str(), engine, nullptr, &inner);
+    ArchiverResult trial = archiver_open(join_dir(dest, rel).c_str(), engine, nullptr, &inner);
     bool is_archive = trial == ARCHIVER_OK || trial == ARCHIVER_ERR_PASSWORD_REQUIRED ||
                       trial == ARCHIVER_ERR_PASSWORD || trial == ARCHIVER_ERR_MISSING_VOLUME;
-    if (trial == ARCHIVER_OK && inner && inner->entries.empty()) is_archive = false;
     archiver_close(inner);
     if (is_archive) archives.push_back(rel);
   }
   if (archives.empty()) return ARCHIVER_OK;
-  std::string pick;
-  if (archives.size() == 1) {
-    pick = archives[0];
+  int decision = archives.size() == 1 ? 0 : -4;
+  if (options && options->all_branches) decision = -3;
+  if (options && options->choose) {
+    std::vector<const char *> views;
+    for (const auto &item : archives) views.push_back(item.c_str());
+    decision = options->choose(views.data(), static_cast<uint32_t>(views.size()), options->user);
   } else if (chosen && chosen[0]) {
-    for (const std::string &rel : archives) {
-      if (rel == chosen) pick = rel;
-    }
-    if (pick.empty()) {
-      message = "choose archive:";
-      for (const std::string &rel : archives) {
-        message.push_back('\n');
-        message += rel;
-      }
-      return ARCHIVER_ERR_NEED_CHOICE;
-    }
-  } else {
+    for (size_t i = 0; i < archives.size(); ++i) if (archives[i] == chosen) decision = static_cast<int>(i);
+  }
+  if (decision == -1) return ARCHIVER_OK;
+  if (decision == -2) return ARCHIVER_ERR_CANCELLED;
+  if (decision != -3 && (decision < 0 || static_cast<size_t>(decision) >= archives.size())) {
     message = "choose archive:";
-    for (const std::string &rel : archives) {
-      message.push_back('\n');
-      message += rel;
-    }
+    for (const auto &rel : archives) message += "\n" + rel;
     return ARCHIVER_ERR_NEED_CHOICE;
   }
-  std::string full = join_dir(dest, pick);
-  ArchiverResult deeper = nested_extract(full, engine, dest, passwords, password_count, nullptr, budget,
-                                          progress, progress_user, message);
-  if (deeper == ARCHIVER_OK) delete_file_at(full);
-  return deeper;
+  for (size_t i = 0; i < archives.size(); ++i) {
+    if (decision != -3 && static_cast<size_t>(decision) != i) continue;
+    std::string next_dest = dest;
+    if (archives.size() > 1) {
+      std::string error;
+      auto safe = archiver::SafeDest::open(dest, error);
+      std::string folder = archives[i] + ".unpacked";
+      if (!safe || !safe->mkdir_entry(folder, error)) {
+        message = "could not create branch output directory";
+        return ARCHIVER_ERR_IO;
+      }
+      next_dest = join_dir(dest, folder);
+    }
+    std::string full = join_dir(dest, archives[i]);
+    ArchiverResult deeper = nested_extract(full, engine, next_dest, passwords, password_count,
+        nullptr, budget, progress, progress_user, message, options);
+    if (deeper != ARCHIVER_OK) return deeper;
+    // Keep all volume parts together; never leave a broken set by deleting only .001.
+    if ((!options || !options->keep_intermediate) && split_kind(basename_lower(full)) == Kind::Unsupported)
+      delete_file_at(full);
+  }
+  return ARCHIVER_OK;
 }
 
 ArchiverResult archiver_extract_nested(const char *archive_path, const char *engine_path,
@@ -2598,6 +2673,21 @@ ArchiverResult archiver_extract_nested(const char *archive_path, const char *eng
   std::string message;
   ArchiverResult result = nested_extract(archive_path, engine_path, dest_dir, passwords, password_count,
                                           chosen_inner, budget, progress, progress_user, message);
+  copy_message(message_buf, message_cap, message);
+  return result;
+}
+
+ArchiverResult archiver_extract_nested_ex(const char *archive_path, const char *engine_path,
+    const char *dest_dir, const char *const *passwords, uint32_t password_count,
+    const ArchiverNestedOptions *options, ArchiverProgressCallback progress, void *progress_user,
+    char *message_buf, uint32_t message_cap) {
+  if (!archive_path || !archive_path[0] || !dest_dir || !dest_dir[0] || !options ||
+      options->max_depth < 1 || options->max_depth > 32 || options->max_output_bytes > kWriteCap)
+    return ARCHIVER_ERR_ARGUMENT;
+  NestedBudget budget;
+  std::string message;
+  ArchiverResult result = nested_extract(archive_path, engine_path, dest_dir, passwords, password_count,
+      nullptr, budget, progress, progress_user, message, options);
   copy_message(message_buf, message_cap, message);
   return result;
 }

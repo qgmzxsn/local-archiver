@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(local-archiver VERSION 0.2.0 LANGUAGES CXX)
+project(local-archiver VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -123,6 +123,17 @@ if(NOT ANDROID AND NOT CMAKE_CROSSCOMPILING)
     set(test_7z_args)
     if(ARCHIVER_TEST_7Z)
       list(APPEND test_7z_args "${ARCHIVER_TEST_7Z}")
+    endif()
+    add_test(NAME disguised_archives
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_disguise.py"
+              $<TARGET_FILE:archiver-cli> "${ARCHIVER_TEST_ENGINE}")
+    if(ARCHIVER_TEST_7Z)
+      add_test(NAME product_workflows
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_product.py"
+                $<TARGET_FILE:archiver-cli> "${ARCHIVER_TEST_ENGINE}" "${ARCHIVER_TEST_7Z}")
+      add_test(NAME nested_workflows
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_nested.py"
+                $<TARGET_FILE:archiver> "${ARCHIVER_TEST_ENGINE}" "${ARCHIVER_TEST_7Z}")
     endif()
     add_test(NAME extraction_regressions
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_regressions.py"
