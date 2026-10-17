@@ -2,7 +2,13 @@
 
 离线打开、浏览和解压本机压缩包的 Windows 桌面程序。文件和密码都在本机处理，无需账号，不上传文件，也不会运行解压出的程序。
 
-当前公开下载仍是 [v0.3.0](https://github.com/qgmzxsn/local-archiver/releases/tag/v0.3.0)。本分支为 **0.4.0 开发版**，下载前请核对版本，旧版不包含下面新增的流程。
+当前版本：[**v0.4.0**](https://github.com/qgmzxsn/local-archiver/releases/tag/v0.4.0)。
+
+[**下载 Windows 64 位便携版**](https://github.com/qgmzxsn/local-archiver/releases/download/v0.4.0/LocalArchiver-0.4.0-windows-x64-portable.zip) · [校验文件](https://github.com/qgmzxsn/local-archiver/releases/download/v0.4.0/SHA256SUMS.txt)
+
+完整解压 ZIP 后运行 `local-archiver.exe`，保留旁边所有 DLL、platforms 和许可文件。无需另装 Qt 或 7-Zip。v0.3.0 保留在历史发行版中。
+
+![Windows 实际界面](docs/screenshots/main-window.png)
 
 ## 解压
 
@@ -43,7 +49,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Windows 可用 `scripts/build-windows-native.ps1`（MinGW Qt）；PR 的 Windows 工作流使用 MSVC 构建真实引擎和界面，运行核心／GUI／凭据迁移测试，再上传便携包和实际截图。检查工作流结果后使用其构建产物；工作流产物不是正式签名发行版。
+Windows 可用 `scripts/build-windows-native.ps1`（MinGW Qt）；PR 的 Windows 工作流使用 MSVC 构建真实引擎和界面，运行核心／GUI／凭据迁移测试，再上传便携包和实际截图。工作流产物用于测试；日常使用请从上面的 Release 下载。本版本未经代码签名。
 
 命令行默认保留兼容模式；`archiver-cli nested 输入包 输出目录 --all` 启用多分支自动解压，`--depth 1` 只解一层，`--keep` 保留中间包。C API 的新流程见 `archiver_extract_nested_ex`。
 

@@ -2,8 +2,8 @@
 
 Original Local Archiver code and icon are MIT licensed; see `LICENSE`.
 
-Windows builds use separate, replaceable shared libraries. Published MinGW
-packages and MSVC CI development packages use different compiler runtimes; only
+Windows builds use separate, replaceable shared libraries. MinGW
+packages and MSVC packages use different compiler runtimes; only
 the runtime DLLs actually present in a package apply to that package. No copy of
 7-Zip or Qt is statically embedded into the application. Source, version and
 license information for the shipped dependencies follows.
@@ -16,11 +16,11 @@ license information for the shipped dependencies follows.
 | GCC runtime (MinGW builds: `libstdc++-6.dll`, `libgcc_s_seh-1.dll`) | 13.1.0 | GPL 3.0 with GCC Runtime Library Exception. License texts under `LICENSES/MinGW/gcc`. Source: https://ftp.gnu.org/gnu/gcc/gcc-13.1.0/gcc-13.1.0.tar.xz |
 | MinGW-w64 / winpthreads (MinGW builds) | 11.0.1 | Notices under `LICENSES/MinGW/mingw-w64` and `LICENSES/MinGW/winpthreads`. Toolchain/source information: https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/tools_mingw1310/qt.tools.win64_mingw1310/ |
 
-MSVC CI development packages instead include Microsoft's Visual C++ runtime
+MSVC packages instead include Microsoft's Visual C++ runtime
 DLLs (`msvcp140*.dll`, `vcruntime140*.dll`, and companion runtime DLLs). Their
 versions and Microsoft copyright notices are recorded in the DLL version
 resources. These Microsoft components are not licensed under MIT, LGPL or the
-GCC exception. MSVC CI packages do not include Qt translation catalogs or the
+GCC exception. MSVC packages do not include Qt translation catalogs or the
 MinGW/GCC runtime. Qt dialog labels explicitly provided by the app remain Chinese.
 
 Packages include Qt's license texts for its bundled third-party components under

@@ -1,4 +1,4 @@
-本地归档 0.4.0 — Windows 64 位开发版
+本地归档 0.4.0 — Windows 64 位便携版
 
 便携版：先完整解压整个文件夹，再运行 local-archiver.exe。
 保留旁边全部 DLL、platforms 和 LICENSES 文件。无需另装 Qt 或 7-Zip。
@@ -22,6 +22,6 @@
 达到大小、文件数或压缩比限制会停止；Windows 暂不创建符号链接。
 分卷中间包保留整组。“添加”目前只创建无压缩 ZIP；不能创建 RAR。
 
-本开发版未经代码签名。请核对来源和构建测试结果。
+本版本未经代码签名。请从项目的 v0.4.0 Release 下载，并核对 SHA256SUMS.txt。
 源代码：https://github.com/qgmzxsn/local-archiver
 第三方许可见 LICENSE、LICENSES 和 THIRD-PARTY-NOTICES.md。
