@@ -352,6 +352,8 @@ class DesktopTests : public QObject {
     QFile output(dest + "/hello.txt");
     QVERIFY(output.open(QIODevice::ReadOnly));
     QCOMPARE(output.readAll(), QByteArray("from-mp4-name"));
+    std::fprintf(stderr, "[desktop] disguisedMp4 done\n");
+    std::fflush(stderr);
   }
 };
 
@@ -363,6 +365,7 @@ int main(int argc, char **argv) {
   engine = args[2];
   DesktopTests tests;
   const int result = QTest::qExec(&tests, 1, argv);
+  std::fprintf(stderr, "[desktop] qExec returned %d\n", result);
   std::fflush(stdout);
   std::fflush(stderr);
   return result;
