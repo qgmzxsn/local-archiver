@@ -269,6 +269,10 @@ class DesktopTests : public QObject {
   void disguisedMp4WithLongTitleExtractsToLegalFolder() {
     const QString leaf = QStringLiteral("【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！ 【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！_1.mp4");
     QCOMPARE(sanitizeFolderComponent(leaf), QStringLiteral("【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！ 【3D】元梦之星人物手办雕刻 zbrush二次元游戏角色模型制作教程！_1"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.zip.001")), QStringLiteral("数据"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.part02.rar")), QStringLiteral("数据"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.iso")), QStringLiteral("数据"));
+    QCOMPARE(sanitizeFolderComponent(QStringLiteral("数据.txt.gz")), QStringLiteral("数据.txt"));
     QCOMPARE(sanitizeFolderComponent(QStringLiteral("bad:name*.mp4")), QStringLiteral("bad_name_"));
     QCOMPARE(sanitizeFolderComponent(QStringLiteral("keep. .mp4")), QStringLiteral("keep"));
     QCOMPARE(sanitizeFolderComponent(QStringLiteral("CON.mp4")), QStringLiteral("解压文件"));

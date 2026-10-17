@@ -64,6 +64,19 @@ jobs:
           Copy-Item LICENSES "$stage/LICENSES" -Recurse
           Copy-Item packaging/windows/README-zh-CN.txt "$stage/README.txt"
           "[Paths]`nPrefix=.`nPlugins=.`n" | Set-Content "$stage/qt.conf"
+          # Check the deployed app without using the SDK or build directory in PATH.
+          $python = (Get-Command python).Source
+          $env:PATH = "$env:SystemRoot/System32;$env:SystemRoot"
+          Copy-Item build/archiver-cli.exe $stage
+          $smoke = "$stage/smoke.zip"
+          & $python -c "import zipfile; z=zipfile.ZipFile(r'$smoke','w'); z.writestr('smoke.txt','offline'); z.close()"
+          & "$stage/archiver-cli.exe" list $smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Staged engine smoke test failed' }
+          $process = Start-Process "$stage/local-archiver.exe" -PassThru
+          Start-Sleep -Seconds 3
+          if ($process.HasExited) { throw "Staged GUI exited: $($process.ExitCode)" }
+          Stop-Process -Id $process.Id
+          Remove-Item "$stage/archiver-cli.exe",$smoke
           Compress-Archive -Path $stage -DestinationPath dist/LocalArchiver-0.4.0-windows-x64-portable.zip
           (Get-FileHash dist/*.zip -Algorithm SHA256).Hash | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4

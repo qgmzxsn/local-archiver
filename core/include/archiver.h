@@ -96,7 +96,7 @@ ARCHIVER_API ArchiverResult archiver_check_symlink(const char *link_path,
                                                     const char *target);
 
 /* Try passwords[0..count) in order. Header check only: the first password
-   that opens the archive (and decrypts the first encrypted item, for formats
+   that opens the archive (and decrypts a small encrypted item, for formats
    that do not fail at Open) is kept. *matched_index is that index, or -1
    when no password was needed. On failure the result is the same as
    archiver_open, including PASSWORD_REQUIRED when every password fails.

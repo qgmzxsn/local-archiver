@@ -9,6 +9,9 @@
 #define _FILE_OFFSET_BITS 64
 #endif
 
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include <stdlib.h>
 
 #if defined(_WIN32)
@@ -2178,6 +2181,7 @@ ArchiverResult probe_encrypted(IInArchive *archive, PasswordState &password, std
   }
   UInt32 index = 0;
   bool found = false;
+  uint64_t smallest = UINT64_MAX;
   for (UInt32 i = 0; i < count; ++i) {
     PROPVARIANT prop;
     memset(&prop, 0, sizeof(prop));
@@ -2189,9 +2193,11 @@ ArchiverResult probe_encrypted(IInArchive *archive, PasswordState &password, std
     if (archive->GetProperty(i, kpidIsDir, &prop) == S_OK) is_dir = prop_bool(prop);
     prop_clear(&prop);
     if (encrypted && !is_dir) {
-      index = i;
-      found = true;
-      break;
+      memset(&prop, 0, sizeof(prop));
+      const bool known = archive->GetProperty(i, kpidSize, &prop) == S_OK && prop.vt != VT_EMPTY;
+      const uint64_t size = known ? prop_u64(prop) : UINT64_MAX;
+      prop_clear(&prop);
+      if (!found || size < smallest) { index = i; found = true; smallest = size; }
     }
   }
   if (!found) return ARCHIVER_OK;
@@ -2245,6 +2251,7 @@ ArchiverResult archiver_open_with_passwords(const char *archive_path, const char
     *out = opened;
     return result;
   }
+  const bool encrypted_headers = result == ARCHIVER_ERR_PASSWORD_REQUIRED;
   archiver_close(opened);
   opened = nullptr;
   if (!passwords || password_count == 0) {
@@ -2270,7 +2277,9 @@ ArchiverResult archiver_open_with_passwords(const char *archive_path, const char
     }
     PasswordState pw = password_from(passwords[i]);
     std::string message;
-    ArchiverResult probed = probe_encrypted(opened->archive, pw, message);
+    // Successful header decryption already verifies this candidate. For ZIP
+    // and other visible-header formats, test the smallest encrypted item.
+    ArchiverResult probed = encrypted_headers ? ARCHIVER_OK : probe_encrypted(opened->archive, pw, message);
     if (probed == ARCHIVER_ERR_PASSWORD || probed == ARCHIVER_ERR_PASSWORD_REQUIRED) {
       archiver_close(opened);
       opened = nullptr;
