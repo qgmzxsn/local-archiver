@@ -2621,13 +2621,27 @@ ArchiverResult nested_extract(const std::string &path, const char *engine, const
   // already present in the destination or traverse extracted symbolic links.
   for (const auto &entry : entries) {
     const std::string &rel = entry.path;
-    if (entry.is_dir || entry.is_symlink || continuation_volume(rel)) continue;
+    if (entry.is_dir || entry.is_symlink) continue;
+    if (continuation_volume(rel)) {
+      const std::string first = leading_volume(rel);
+      const bool present = std::any_of(entries.begin(), entries.end(), [&](const ListedEntry &item) {
+        return !item.is_dir && !item.is_symlink && item.path == first;
+      });
+      if (present) continue;
+      message = "missing volume: " + first;
+      return ARCHIVER_ERR_MISSING_VOLUME;
+    }
     if (classify(rel) == Kind::Unsupported && !is_disguise_carrier(rel)) continue;
     if (progress && progress(0, 0, progress_user)) return ARCHIVER_ERR_CANCELLED;
     ArchiverArchive *inner = nullptr;
     ArchiverResult trial = archiver_open(join_dir(dest, rel).c_str(), engine, nullptr, &inner);
     bool is_archive = trial == ARCHIVER_OK || trial == ARCHIVER_ERR_PASSWORD_REQUIRED ||
                       trial == ARCHIVER_ERR_PASSWORD || trial == ARCHIVER_ERR_MISSING_VOLUME;
+    if (!is_archive && classify(rel) != Kind::Unsupported) {
+      message = rel + ": " + (inner ? inner->message : archiver_result_string(trial));
+      archiver_close(inner);
+      return trial;
+    }
     archiver_close(inner);
     if (is_archive) archives.push_back(rel);
   }

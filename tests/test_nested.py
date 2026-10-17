@@ -164,6 +164,19 @@ class NestedTests(unittest.TestCase):
         self.assertFalse((out / 'unexpected').exists())
         self.assertTrue((out / 'unrelated.zip').exists())
 
+    def test_broken_inner_archive_stops_with_name(self):
+        archive = self.archive('outer.zip', {'broken.zip': b'not a zip'})
+        code, message, out = self.run_extract(archive)
+        self.assertEqual(code, 3)
+        self.assertIn('broken.zip', message)
+        self.assertTrue((out / 'broken.zip').exists())
+
+    def test_ordinary_media_is_a_final_payload(self):
+        archive = self.archive('outer.zip', {'photo.png': b'ordinary media without archive'})
+        code, message, out = self.run_extract(archive)
+        self.assertEqual(code, 0, message)
+        self.assertTrue((out / 'photo.png').exists())
+
     def test_byte_limit(self):
         archive = self.archive('outer.zip', {'large.bin': b'x' * 5000})
         self.options.bytes = 4000
@@ -208,6 +221,13 @@ class NestedTests(unittest.TestCase):
         code, message, out = self.run_extract(str(base) + '.002')
         self.assertEqual(code, 0, message)
         self.assertEqual((out / 'payload.bin').read_bytes(), source.read_bytes())
+
+    def test_nested_missing_first_volume_is_not_silently_skipped(self):
+        archive = self.archive('outer.zip', {'parts.7z.002': b'continuation'})
+        code, message, out = self.run_extract(archive)
+        self.assertEqual(code, 10)
+        self.assertIn('parts.7z.001', message)
+        self.assertTrue((out / 'parts.7z.002').exists())
 
     def test_missing_leading_volume_is_named(self):
         archive = self.root / 'parts.7z.002'
